@@ -19,7 +19,6 @@ import os
 import sys
 import tempfile
 import threading
-import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -181,7 +180,7 @@ async def _http_contract(label: str) -> None:
         # 8. cookies can be sent back
         r = await s.get(f"{BASE}/echo", cookies={"lid": "777"})
         sent = {k.lower(): v for k, v in (r.json() or {}).get("headers", {}).items()}
-        check("777" in (sent.get("cookie") or ""), f"outgoing cookie sent: "
+        check("777" in (sent.get("cookie") or ""), "outgoing cookie sent: "
                                                     f"{sent.get('cookie')!r}")
 
         # 9. error statuses come back as Response, never as exceptions
@@ -201,7 +200,7 @@ async def _http_contract(label: str) -> None:
     try:
         async with B.HTTP.session() as s:
             r = await s.get(f"{BASE}/big")
-            check(len(r.text) <= 4096, f"body truncated to max_body_bytes "
+            check(len(r.text) <= 4096, "body truncated to max_body_bytes "
                                        f"({len(r.text)} bytes)")
     finally:
         object.__setattr__(B.CFG, "max_body_bytes", 2000000)
@@ -385,7 +384,7 @@ def t_registry_intact():
     print("\n— registry & profiles (untouched by the port) —")
     check(len(B.REGISTRY) >= 30, f"{len(B.REGISTRY)} shortener domains registered",
           "requirement was 30+")
-    check(len(B.REGISTRY) == 144, f"registry has exactly 144 domains",
+    check(len(B.REGISTRY) == 144, "registry has exactly 144 domains",
           f"got {len(B.REGISTRY)}")
     gpl = B.profile_for("https://gplinks.co/BFfOX")
     check(gpl.handler == "gplinks", f"gplinks.co -> {gpl.handler!r} handler")

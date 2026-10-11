@@ -55,31 +55,80 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 
-from bs4 import BeautifulSoup
+def _die(msg: str):
+    """Print an actionable error and exit. Used before logging is configured."""
+    print(f"\n\033[1;31m✗ SHADOWLINKS cannot start\033[0m\n\n{msg}\n",
+          file=sys.stderr)
+    raise SystemExit(2)
 
-import telegram
-from telegram import (
-    Bot,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    LinkPreviewOptions,
-    Message,
-    ReplyKeyboardMarkup,
-    Update,
-)
-from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, Forbidden, RetryAfter
-from telegram.ext import (
-    Application,
-    CallbackContext,
-    CallbackQueryHandler,
-    CommandHandler,
-    Defaults,
-    MessageHandler,
-    filters,
-)
+
+_PIP = f'"{sys.executable}" -m pip'
+
+# ── dependency guard ──────────────────────────────────────────────────────
+# The single most common install mistake, and the one that produces the most
+# confusing traceback: `pip install telegram`.
+#
+# That is an unrelated 2013 name-squat whose entire source is
+#     class Telegram: print("coming soon...")
+# and it shadows the real library, so `from telegram import Bot` fails with a
+# bare ImportError that gives no hint what went wrong. The framework this bot
+# needs is `python-telegram-bot` - that is the distribution which PROVIDES the
+# `telegram` import name. Detect it and say so plainly.
+try:
+    import telegram
+    from telegram import (
+        Bot,
+        CallbackQuery,
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+        KeyboardButton,
+        LinkPreviewOptions,
+        Message,
+        ReplyKeyboardMarkup,
+        Update,
+    )
+    from telegram.constants import ChatAction, ParseMode
+    from telegram.error import BadRequest, Forbidden, RetryAfter
+    from telegram.ext import (
+        Application,
+        CallbackContext,
+        CallbackQueryHandler,
+        CommandHandler,
+        Defaults,
+        MessageHandler,
+        filters,
+    )
+except ImportError as _exc:
+    _where = ""
+    with contextlib.suppress(Exception):
+        import telegram as _tg_probe
+        _where = getattr(_tg_probe, "__file__", "") or ""
+    _squatted = ("cannot import name" in str(_exc) and "telegram" in str(_exc)) \
+        or bool(_where) and not hasattr(__import__("telegram"), "Bot")
+    if _squatted:
+        _die(
+            "The WRONG 'telegram' package is installed.\n\n"
+            f"  Found: {_where or '(unknown)'}\n\n"
+            "  `pip install telegram` installs an unrelated placeholder package\n"
+            "  whose whole source is `print('coming soon...')`, and it shadows the\n"
+            "  real library. This bot needs `python-telegram-bot`, which is the\n"
+            "  distribution that provides the `telegram` import name.\n\n"
+            "  Fix it with:\n"
+            f"      {_PIP} uninstall -y telegram\n"
+            f"      {_PIP} install -U python-telegram-bot\n\n"
+            "  On Termux, `bash install-termux.sh` detects and fixes this for you.")
+    _die(
+        f"A required package is missing: {_exc}\n\n"
+        "  Install the dependencies with:\n"
+        f"      {_PIP} install -U python-telegram-bot beautifulsoup4 curl_cffi httpx\n"
+        "  or on Termux:\n"
+        "      bash install-termux.sh")
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError as _exc:
+    _die(f"BeautifulSoup4 is missing: {_exc}\n\n"
+         f"      {_PIP} install -U beautifulsoup4\n")
 
 # Printed by --check so a mis-installed framework is obvious at a glance.
 # PTB exposes __version__, not VERSION.
@@ -94,6 +143,83 @@ log = logging.getLogger("shadowlinks")
 # ══════════════════════════════════════════════════════════════════════════
 # §1  CONFIG
 # ══════════════════════════════════════════════════════════════════════════
+#
+#  ▸▸▸  EDIT THE BLOCK BELOW. THAT IS THE ONLY SETUP THERE IS.  ◂◂◂
+#
+#  There is no .env file and nothing else to configure. Change BOT_TOKEN and
+#  ADMIN_IDS, save, then run:
+#
+#      python shadowlinks_bot.py
+#
+#  Everything after those two already has a working default.
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── REQUIRED — the only two you must set ──────────────────────────────────
+# From @BotFather -> /newbot
+BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
+
+# Your Telegram user id (get it from @userinfobot). Comma separate for more.
+# Admins are permanently VIP and get the whole /admin panel.
+ADMIN_IDS = "PASTE_YOUR_TELEGRAM_USER_ID"
+
+# ── presentation ──────────────────────────────────────────────────────────
+BOT_NAME           = "SHADOWLINKS"
+SUPPORT_USERNAME   = ""     # username people DM to buy VIP (no @ sign)
+CHANNEL_URL        = ""     # pinned channel link, shown on /start
+PRICE_LINE         = ("VIP = unlimited resolves, no cooldown, batch mode, "
+                      "full redirect chain.")
+SHOW_CHAIN_TO_FREE = False  # True = free users also see the redirect chain
+FORCE_CHANNEL      = False  # True = refuse to resolve until they join CHANNEL_URL
+
+# ── free vs VIP limits ────────────────────────────────────────────────────
+FREE_DAILY_LIMIT = 5        # resolves per day for non-VIP
+FREE_COOLDOWN    = 45       # seconds a free user waits between links
+FREE_BATCH_LIMIT = 0        # 0 = batch mode is VIP-only
+VIP_DAILY_LIMIT  = 0        # 0 = unlimited
+VIP_BATCH_LIMIT  = 25       # max links per batch message
+
+# ── resolver tuning ───────────────────────────────────────────────────────
+MAX_HOPS        = 14        # redirect chain depth ceiling
+HTTP_TIMEOUT    = 35.0      # seconds per request
+GOLINK_DELAY    = 10.0      # anti-bot timer wait, seconds
+FORM_RETRIES    = 2         # extra POST attempts after a timer rejection
+ADAPTIVE_DELAY  = True      # learn each site's timer so the happy path is fast
+MAX_CONCURRENCY = 8         # resolves in flight at once
+RESOLVE_CHAINS  = True      # keep walking shortener -> ad-gate -> final
+
+# ── HTTP backend ──────────────────────────────────────────────────────────
+# curl_cffi impersonates Chrome at the TLS layer. This is what defeats the
+# Cloudflare shield in front of GPLinks. Turning it off makes those sites 403.
+USE_CURL_CFFI = True
+IMPERSONATE   = "chrome"    # chrome, safari, edge or firefox
+
+# ── add shorteners WITHOUT touching any code below ────────────────────────
+# Comma separated hostnames, merged into the built-in table at boot. A new
+# GPLinks mirror appeared? Add it here and restart.
+EXTRA_GPLINKS_DOMAINS  = ""   # e.g. "gplinks.uk,gplink.xyz"
+EXTRA_FORM_DOMAINS     = ""
+EXTRA_REDIRECT_DOMAINS = ""
+EXTRA_ADFLY_DOMAINS    = ""
+
+# ── storage, logging, security ────────────────────────────────────────────
+DB_PATH      = "shadowlinks.db"   # created next to this file on first run
+LOG_RESOLVES = True               # keep rows for /logs and /stats
+LOG_LEVEL    = "INFO"             # DEBUG shows every redirect hop
+MAX_BODY_BYTES = 2_000_000
+
+# Leave this False. Setting it True lets the bot fetch private/loopback
+# addresses, which turns it into an SSRF probe against your own network.
+ALLOW_PRIVATE_NETWORKS = False
+
+# Optional, and off by default: read a .env file next to this script if one
+# exists. Not needed — the block above is the configuration. Environment
+# variables always override the block either way (useful for Docker/systemd).
+USE_DOTENV = False
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Nothing below this line needs editing.
+# ══════════════════════════════════════════════════════════════════════════
+
 
 def load_dotenv(path: str = ".env") -> None:
     """Minimal dependency-free .env loader (values already in env win)."""
@@ -150,6 +276,12 @@ def _env_bool(key: str, default: bool = False) -> bool:
     return raw in ("1", "true", "yes", "y", "on", "enable", "enabled")
 
 
+def _split_hosts(raw: str) -> tuple[str, ...]:
+    """Comma/whitespace separated host list -> clean lowercase tuple."""
+    return tuple(h.lower().strip().lstrip(".")
+                 for h in re.split(r"[,\s;]+", raw or "") if h.strip())
+
+
 def _env_list(key: str, default: str = "") -> list[int]:
     """Comma/space separated list of Telegram user ids."""
     raw = _env(key, default)
@@ -161,64 +293,67 @@ def _env_list(key: str, default: str = "") -> list[int]:
     return out
 
 
-load_dotenv()
+if USE_DOTENV:
+    load_dotenv()
 
 
 @dataclass(frozen=True)
 class Config:
+    """Precedence: a real environment variable wins, otherwise the SETTINGS
+    block at the top of this file. That keeps `BOT_TOKEN=... python bot.py`
+    and Docker/systemd working without reintroducing a config file."""
     # --- credentials -----------------------------------------------------
-    token: str = _env("BOT_TOKEN")
-    admin_ids: tuple[int, ...] = tuple(_env_list("ADMIN_IDS") or _env_list("OWNER_IDS"))
+    token: str = _env("BOT_TOKEN", BOT_TOKEN)
+    admin_ids: tuple[int, ...] = tuple(_env_list("ADMIN_IDS", ADMIN_IDS)
+                                     or _env_list("OWNER_IDS", ADMIN_IDS))
 
     # --- storage ---------------------------------------------------------
-    db_path: str = _env("DB_PATH", "shadowlinks.db")
+    db_path: str = _env("DB_PATH", DB_PATH)
 
     # --- resolver --------------------------------------------------------
-    max_hops: int = _env_int("MAX_HOPS", 14)
-    http_timeout: float = _env_float("HTTP_TIMEOUT", 35.0)
-    impersonate: str = _env("IMPERSONATE", "chrome")
-    golink_delay: float = _env_float("GOLINK_DELAY", 10.0)      # anti-bot timer wait
-    form_retries: int = _env_int("FORM_RETRIES", 2)
-    concurrency: int = _env_int("MAX_CONCURRENCY", 8)           # simultaneous resolves
-    adaptive_delay: bool = _env_bool("ADAPTIVE_DELAY", True)
-    use_curl_cffi: bool = _env_bool("USE_CURL_CFFI", True)
-    resolve_chains: bool = _env_bool("RESOLVE_CHAINS", True)
+    max_hops: int = _env_int("MAX_HOPS", MAX_HOPS)
+    http_timeout: float = _env_float("HTTP_TIMEOUT", HTTP_TIMEOUT)
+    impersonate: str = _env("IMPERSONATE", IMPERSONATE)
+    golink_delay: float = _env_float("GOLINK_DELAY", GOLINK_DELAY)   # anti-bot timer
+    form_retries: int = _env_int("FORM_RETRIES", FORM_RETRIES)
+    concurrency: int = _env_int("MAX_CONCURRENCY", MAX_CONCURRENCY)  # parallel resolves
+    adaptive_delay: bool = _env_bool("ADAPTIVE_DELAY", ADAPTIVE_DELAY)
+    use_curl_cffi: bool = _env_bool("USE_CURL_CFFI", USE_CURL_CFFI)
+    resolve_chains: bool = _env_bool("RESOLVE_CHAINS", RESOLVE_CHAINS)
 
     # --- safety ----------------------------------------------------------
-    allow_private_nets: bool = _env_bool("ALLOW_PRIVATE_NETWORKS", False)
-    max_body_bytes: int = _env_int("MAX_BODY_BYTES", 2_000_000)
+    allow_private_nets: bool = _env_bool("ALLOW_PRIVATE_NETWORKS",
+                                         ALLOW_PRIVATE_NETWORKS)
+    max_body_bytes: int = _env_int("MAX_BODY_BYTES", MAX_BODY_BYTES)
 
     # --- VIP / quota -----------------------------------------------------
-    free_daily_limit: int = _env_int("FREE_DAILY_LIMIT", 5)
-    free_cooldown: int = _env_int("FREE_COOLDOWN", 45)          # seconds between reqs
-    vip_daily_limit: int = _env_int("VIP_DAILY_LIMIT", 0)       # 0 = unlimited
-    vip_batch_limit: int = _env_int("VIP_BATCH_LIMIT", 25)
-    free_batch_limit: int = _env_int("FREE_BATCH_LIMIT", 0)     # 0 = batch is VIP-only
+    free_daily_limit: int = _env_int("FREE_DAILY_LIMIT", FREE_DAILY_LIMIT)
+    free_cooldown: int = _env_int("FREE_COOLDOWN", FREE_COOLDOWN)   # secs between reqs
+    vip_daily_limit: int = _env_int("VIP_DAILY_LIMIT", VIP_DAILY_LIMIT)  # 0 = unlimited
+    vip_batch_limit: int = _env_int("VIP_BATCH_LIMIT", VIP_BATCH_LIMIT)
+    free_batch_limit: int = _env_int("FREE_BATCH_LIMIT", FREE_BATCH_LIMIT)  # 0 = VIP-only
 
     # --- presentation ----------------------------------------------------
-    bot_name: str = _env("BOT_NAME", "SHADOWLINKS")
-    support_username: str = _env("SUPPORT_USERNAME", "")
-    channel_url: str = _env("CHANNEL_URL", "")
-    force_channel: bool = _env_bool("FORCE_CHANNEL", False)
-    price_line: str = _env(
-        "PRICE_LINE",
-        "VIP = unlimited resolves, no cooldown, batch mode, full redirect chain."
-    )
-    show_chain_to_free: bool = _env_bool("SHOW_CHAIN_TO_FREE", False)
-    log_resolves: bool = _env_bool("LOG_RESOLVES", True)
-    log_level: str = _env("LOG_LEVEL", "INFO")
+    bot_name: str = _env("BOT_NAME", BOT_NAME)
+    support_username: str = _env("SUPPORT_USERNAME", SUPPORT_USERNAME)
+    channel_url: str = _env("CHANNEL_URL", CHANNEL_URL)
+    force_channel: bool = _env_bool("FORCE_CHANNEL", FORCE_CHANNEL)
+    price_line: str = _env("PRICE_LINE", PRICE_LINE)
+    show_chain_to_free: bool = _env_bool("SHOW_CHAIN_TO_FREE", SHOW_CHAIN_TO_FREE)
+    log_resolves: bool = _env_bool("LOG_RESOLVES", LOG_RESOLVES)
+    log_level: str = _env("LOG_LEVEL", LOG_LEVEL)
 
     # --- user-extensible registry ----------------------------------------
     # Comma separated hostnames merged into the built-in table at boot, so new
     # shorteners can be added without touching the code.
-    extra_gplinks: tuple[str, ...] = tuple(
-        _s for _s in re.split(r"[,\s]+", _env("EXTRA_GPLINKS_DOMAINS")) if _s)
-    extra_form: tuple[str, ...] = tuple(
-        _s for _s in re.split(r"[,\s]+", _env("EXTRA_FORM_DOMAINS")) if _s)
-    extra_redirect: tuple[str, ...] = tuple(
-        _s for _s in re.split(r"[,\s]+", _env("EXTRA_REDIRECT_DOMAINS")) if _s)
-    extra_adfly: tuple[str, ...] = tuple(
-        _s for _s in re.split(r"[,\s]+", _env("EXTRA_ADFLY_DOMAINS")) if _s)
+    extra_gplinks: tuple[str, ...] = _split_hosts(
+        _env("EXTRA_GPLINKS_DOMAINS", EXTRA_GPLINKS_DOMAINS))
+    extra_form: tuple[str, ...] = _split_hosts(
+        _env("EXTRA_FORM_DOMAINS", EXTRA_FORM_DOMAINS))
+    extra_redirect: tuple[str, ...] = _split_hosts(
+        _env("EXTRA_REDIRECT_DOMAINS", EXTRA_REDIRECT_DOMAINS))
+    extra_adfly: tuple[str, ...] = _split_hosts(
+        _env("EXTRA_ADFLY_DOMAINS", EXTRA_ADFLY_DOMAINS))
 
 
 CFG = Config()
@@ -3372,12 +3507,24 @@ def preflight() -> bool:
     problems: list[str] = []
     warnings: list[str] = []
 
-    if not CFG.token or ":" not in CFG.token:
-        problems.append("BOT_TOKEN is missing. Create a bot with @BotFather, then put "
-                        "the token in .env as BOT_TOKEN=123456:ABC-DEF…")
+    _placeholder = ("PASTE_YOUR_BOT_TOKEN_HERE" in CFG.token
+                    or "PASTE_YOUR_TELEGRAM_USER_ID" in str(CFG.admin_ids)
+                    or not CFG.token or ":" not in CFG.token)
+    if _placeholder:
+        problems.append(
+            "BOT_TOKEN is not set.\n"
+            "           Open THIS FILE in a text editor and look for the SETTINGS block\n"
+            "           near the top (search for 'EDIT THE BLOCK BELOW'), then set:\n"
+            "               BOT_TOKEN = \"123456789:AA...your real token...\"\n"
+            "           Get the token from @BotFather -> /newbot. There is no .env\n"
+            "           file - this file is the configuration.")
     if not CFG.admin_ids:
-        problems.append("ADMIN_IDS is empty. Set ADMIN_IDS=<your telegram user id> so "
-                        "you can grant VIP. Get your id from @userinfobot.")
+        problems.append(
+            "ADMIN_IDS is not set.\n"
+            "           In the same SETTINGS block near the top of this file, set:\n"
+            "               ADMIN_IDS = \"123456789\"   # your numeric Telegram user id\n"
+            "           Get your id by messaging @userinfobot. Without it nobody can\n"
+            "           grant VIP or use /admin.")
 
     if not HTTP._cffi_ok:
         # The bot still runs, but the reason it exists stops working. Say so
@@ -3429,12 +3576,17 @@ def main() -> int:
               f"{CFG.free_cooldown}s cooldown")
         print(f"  vip batch        : {CFG.vip_batch_limit} links/message")
         print(f"  admins           : {CFG.admin_ids or '(none)'}")
-        print(f"  token            : {'set' if CFG.token else 'MISSING'}")
-        return 0 if CFG.token else 2
+        _ph = "PASTE_YOUR" in CFG.token or not CFG.admin_ids
+        print(f"  token            : "
+              f"{'PLACEHOLDER - edit this file' if _ph else 'set'}")
+        print(f"  config source    : SETTINGS block in this file"
+              f"{'' if USE_DOTENV else ' (no .env)'}")
+        return 2 if _ph or ":" not in CFG.token else 0
 
     if not preflight():
-        print("\nRefusing to start. Fix .env and re-run "
-              "(or pass --check to inspect the build).", file=sys.stderr)
+        print("\nRefusing to start. Edit the SETTINGS block at the top of "
+              "shadowlinks_bot.py\nand re-run (or pass --check to inspect the "
+              "build).", file=sys.stderr)
         return 2
 
     app = build_application()

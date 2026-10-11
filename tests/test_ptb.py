@@ -19,7 +19,6 @@ import sys
 import tempfile
 import time
 import traceback
-from datetime import datetime, timezone
 
 # ── environment must be set BEFORE shadowlinks_bot is imported (CFG is a
 #    frozen dataclass built at import time) ────────────────────────────────
@@ -319,7 +318,7 @@ def t_command_args_multiword():
     dispatch(msg_update("/gencode 30 5 birthday giveaway", uid=ADMIN))
     txt = REC.last_text()
     codes = [l for l in txt.splitlines() if l.startswith("<code>")]
-    check(len(codes) == 5, f"/gencode 30 5 … made 5 codes", f"got {len(codes)}")
+    check(len(codes) == 5, "/gencode 30 5 … made 5 codes", f"got {len(codes)}")
     rows = B.DB.list_codes()
     check(any(r["days"] == 30 for r in rows), "days parsed as 30 (first arg)")
     check(any("birthday giveaway" in (r["note"] or "") for r in rows),
@@ -421,7 +420,7 @@ def t_unknown_command_falls_through():
 def t_non_text():
     print("\n— non-text message —")
     reset()
-    dispatch(msg_update(None, extra={"photo": [{"file_id": "f", "file_unique_id": "u",
+    dispatch(msg_update(None, extra={"photo": [{"file_id": "", "file_unique_id": "u",
                                                 "width": 10, "height": 10}]}))
     check("as <b>text</b>" in REC.last_text(), "photo gets the text-only hint",
           REC.last_text()[:120])
@@ -505,17 +504,17 @@ def t_batch_fsm_vip():
     check("Added" in txt and "total" in txt, "link accumulated in batch state",
           txt[:120])
     acc = B._STATE[VIP]["data"]["urls"]
-    check(len(acc) == 1, f"1 URL buffered", str(acc))
+    check(len(acc) == 1, "1 URL buffered", str(acc))
 
     reset()
     dispatch(msg_update("https://gplinks.co/bbb\nhttps://gplinks.co/ccc", uid=VIP))
     acc = B._STATE[VIP]["data"]["urls"]
-    check(len(acc) == 3, f"3 URLs buffered after a 2-link message", str(acc))
+    check(len(acc) == 3, "3 URLs buffered after a 2-link message", str(acc))
 
     reset()
     asked = stub_resolver(final="https://real.example/x")
     dispatch(msg_update("/done", uid=VIP))
-    check(len(asked) == 3, f"/done resolved all 3 buffered links", str(asked))
+    check(len(asked) == 3, "/done resolved all 3 buffered links", str(asked))
     body = " ".join(REC.texts() + REC.texts("editMessageText"))
     check("Batch complete" in body and "3/3" in body, "batch summary shows 3/3",
           body[:200])
@@ -548,7 +547,7 @@ def t_multi_link_message_nonvip():
     dispatch(msg_update("https://gplinks.co/aaa https://gplinks.co/bbb"))
     check("Batch mode is a <b>VIP</b> feature" in " ".join(REC.texts()),
           "free user told batch is VIP-only")
-    check(len(asked) == 1, f"only the FIRST link resolved for a free user", str(asked))
+    check(len(asked) == 1, "only the FIRST link resolved for a free user", str(asked))
 
 
 def t_broadcast_fsm():
@@ -665,7 +664,7 @@ def t_vip_admin_ops():
     check(u.is_vip, "/addvip granted VIP")
     check("VIP granted" in REC.last_text(), "/addvip confirms")
     check("15 day" in REC.last_text().lower() or u.vip_remaining().days >= 14,
-          f"/addvip honoured the 15-day argument", REC.last_text()[:120])
+          "/addvip honoured the 15-day argument", REC.last_text()[:120])
 
     reset()
     dispatch(msg_update(f"/addvip {FREE} perm", uid=ADMIN))
@@ -733,7 +732,7 @@ def t_setdelay_and_delays():
     dispatch(msg_update("/setdelay gplinks.co 12", uid=ADMIN))
     check("pinned" in REC.last_text(), "/setdelay confirms")
     check(abs(B.DB.get_delay("gplinks.co") - 12.0) < 0.01,
-          f"delay persisted as 12s", str(B.DB.get_delay("gplinks.co")))
+          "delay persisted as 12s", str(B.DB.get_delay("gplinks.co")))
     reset()
     dispatch(msg_update("/setdelay gplinks.co", uid=ADMIN))
     check("Usage:" in REC.last_text(), "/setdelay with 1 arg shows usage")

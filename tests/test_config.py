@@ -73,12 +73,12 @@ def t_inline_comment():
         "IMPERSONATE=chrome    #  safari would also work\n",
         ["USE_CURL_CFFI", "ADAPTIVE_DELAY", "IMPERSONATE"])
     check(got["USE_CURL_CFFI"] == "1",
-          f"USE_CURL_CFFI parses as exactly '1'", repr(got["USE_CURL_CFFI"]))
+          "USE_CURL_CFFI parses as exactly '1'", repr(got["USE_CURL_CFFI"]))
     check(B._env_bool("USE_CURL_CFFI") is True,
           "_env_bool therefore returns True (backend stays ON)")
     check(got["ADAPTIVE_DELAY"] == "1", "trailing comment after a single space",
           repr(got["ADAPTIVE_DELAY"]))
-    check(got["IMPERSONATE"] == "chrome", f"value before comment kept",
+    check(got["IMPERSONATE"] == "chrome", "value before comment kept",
           repr(got["IMPERSONATE"]))
 
 
@@ -150,7 +150,7 @@ def t_env_bool():
     for v in ("1", "true", "TRUE", "yes", "Y", "on", "enable", "enabled"):
         os.environ["B_KEY"] = v
         check(B._env_bool("B_KEY") is True, f"{v!r} is truthy")
-    for v in ("0", "false", "no", "off", "n", "", "  ", "banana", "2"):
+    for v in ("0", "false", "no", "of", "n", "", "  ", "banana", "2"):
         os.environ["B_KEY"] = v
         check(B._env_bool("B_KEY") is False, f"{v!r} is falsy")
     os.environ.pop("B_KEY", None)
@@ -199,13 +199,28 @@ def t_env_numbers():
 
 
 def t_shipped_env_file():
-    """The parser must agree with the file that actually ships."""
-    print("\n— the shipped .env / .env.example —")
-    for name in (".env", ".env.example"):
-        path = os.path.join(REPO, name)
-        if not os.path.isfile(path):
-            print(f"  \033[33mskip\033[0m  {name} not present")
-            continue
+    """No env file may ship, and the parser must still round-trip one."""
+    print("\n— no .env ships; the parser is still correct —")
+    # The whole point of the rework: config lives INSIDE shadowlinks_bot.py.
+    shipped = [n for n in (".env", ".env.example", ".env.sample", "config.ini",
+                           "config.json", "settings.py")
+               if os.path.isfile(os.path.join(REPO, n))]
+    check(not shipped, "no .env / config file ships in the repo",
+          "present: " + ", ".join(shipped))
+    check("PASTE_YOUR" in open(os.path.join(REPO, "shadowlinks_bot.py"),
+                               encoding="utf-8").read()
+          or os.environ.get("BOT_TOKEN"),
+          "the file itself carries the token (placeholder in git, real in the zip)")
+
+    # Exercise the round-trip against a synthetic file so a USE_DOTENV=True
+    # user is still covered even though nothing ships.
+    for name in ("<synthetic>",):
+        path = os.path.join(tempfile.mkdtemp(), "dotenv_roundtrip")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("# a comment\n\n"
+                     'PLAIN=bare\nQUOTED="quoted value"\n'
+                     "SPACED =  padded  \nEMPTY=\n"
+                     "INLINE=value  # trailing comment\n")
         text = open(path, encoding="utf-8").read()
         # Every non-comment line with '=' must survive a round trip.
         problems = []
@@ -229,13 +244,14 @@ def t_shipped_env_file():
                     problems.append(f"{k}: {got!r} != {v[1:-1]!r}")
             elif got != v:
                 problems.append(f"{k}: {got!r} != {v!r}")
-        check(not problems, f"every key in {name} round-trips", "; ".join(problems[:6]))
+        check(not problems, "a .env round-trips if USE_DOTENV=True is set",
+              "; ".join(problems[:6]))
 
     # The live CFG must reflect a curl_cffi-enabled build.
     check(B.CFG.use_curl_cffi is True,
           "CFG.use_curl_cffi is True for the shipped configuration",
           f"got {B.CFG.use_curl_cffi!r} - this is exactly the silent failure "
-          f"mode this file guards")
+          "mode this file guards")
     check(bool(B.CFG.admin_ids), f"CFG.admin_ids populated: {B.CFG.admin_ids}")
     check(len(B.CFG.token.split(":")) == 2, "CFG.token has the id:secret shape")
 
@@ -255,6 +271,125 @@ def t_preflight_and_check():
         object.__setattr__(B.CFG, "token",
                           "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11")
     check(B.preflight() is True, "preflight passes again once restored")
+
+
+def t_settings_block_is_the_config():
+    """There is no .env any more: the SETTINGS block in the file IS the config."""
+    print("\n— in-file SETTINGS block —")
+    required = [
+        "BOT_TOKEN", "ADMIN_IDS", "BOT_NAME", "SUPPORT_USERNAME", "CHANNEL_URL",
+        "PRICE_LINE", "SHOW_CHAIN_TO_FREE", "FORCE_CHANNEL", "FREE_DAILY_LIMIT",
+        "FREE_COOLDOWN", "FREE_BATCH_LIMIT", "VIP_DAILY_LIMIT", "VIP_BATCH_LIMIT",
+        "MAX_HOPS", "HTTP_TIMEOUT", "GOLINK_DELAY", "FORM_RETRIES",
+        "ADAPTIVE_DELAY", "MAX_CONCURRENCY", "RESOLVE_CHAINS", "USE_CURL_CFFI",
+        "IMPERSONATE", "EXTRA_GPLINKS_DOMAINS", "EXTRA_FORM_DOMAINS",
+        "EXTRA_REDIRECT_DOMAINS", "EXTRA_ADFLY_DOMAINS", "DB_PATH",
+        "LOG_RESOLVES", "LOG_LEVEL", "MAX_BODY_BYTES",
+        "ALLOW_PRIVATE_NETWORKS",
+    ]
+    missing = [k for k in required if not hasattr(B, k)]
+    check(not missing, f"all {len(required)} settings are editable module constants",
+          f"missing: {missing}")
+
+    check(B.USE_DOTENV is False,
+          "USE_DOTENV defaults to False, so no .env file is read at import")
+    check(isinstance(B.BOT_TOKEN, str) and isinstance(B.ADMIN_IDS, str),
+          "the two REQUIRED values are plain strings a user can just overwrite")
+    check(B.ALLOW_PRIVATE_NETWORKS is False,
+          "ALLOW_PRIVATE_NETWORKS ships False (SSRF guard on)")
+    check(B.USE_CURL_CFFI is True,
+          "USE_CURL_CFFI ships True (Chrome TLS impersonation on)")
+
+    # the block must appear near the top, before any real logic
+    src = open(os.path.join(REPO, "shadowlinks_bot.py"), encoding="utf-8").read()
+    at = src.index("EDIT THE BLOCK BELOW")
+    check(at < src.index("# §2  DATABASE"),
+          "the SETTINGS block sits above §2, so it is the first thing you see")
+    check(src.count("BOT_TOKEN =") >= 1, "BOT_TOKEN is assigned in the block")
+
+
+def t_env_still_overrides_settings():
+    """Env vars win over the block - that keeps Docker/systemd/CI working."""
+    print("\n— precedence: environment over SETTINGS —")
+    os.environ.pop("PROBE_KEY", None)
+    check(B._env("PROBE_KEY", "from_settings") == "from_settings",
+          "SETTINGS value is used when no environment variable is set")
+    os.environ["PROBE_KEY"] = "from_env"
+    check(B._env("PROBE_KEY", "from_settings") == "from_env",
+          "a real environment variable overrides the SETTINGS block")
+    os.environ.pop("PROBE_KEY", None)
+
+    os.environ["PROBE_N"] = "77"
+    check(B._env_int("PROBE_N", B.FREE_DAILY_LIMIT) == 77, "_env_int honours env")
+    os.environ.pop("PROBE_N", None)
+    check(B._env_int("PROBE_N", B.FREE_DAILY_LIMIT) == B.FREE_DAILY_LIMIT,
+          "_env_int falls back to the SETTINGS value")
+
+    os.environ["PROBE_B"] = "0"
+    check(B._env_bool("PROBE_B", True) is False, "_env_bool honours env")
+    os.environ.pop("PROBE_B", None)
+    check(B._env_bool("PROBE_B", True) is True,
+          "_env_bool falls back to the SETTINGS value")
+
+
+def t_split_hosts():
+    print("\n— _split_hosts (EXTRA_*_DOMAINS) —")
+    cases = {
+        "": (),
+        "   ": (),
+        "a.com": ("a.com",),
+        "a.com,b.com": ("a.com", "b.com"),
+        " A.com , B.COM ; c.com ": ("a.com", "b.com", "c.com"),
+        ".leading.com": ("leading.com",),
+        "a.com,,b.com": ("a.com", "b.com"),
+    }
+    for raw, want in cases.items():
+        got = B._split_hosts(raw)
+        check(got == want, f"{raw!r} -> {want}", f"got {got}")
+
+    # the four EXTRA_* settings must reach the registry through apply_extra_domains
+    os.environ["EXTRA_REDIRECT_DOMAINS"] = "probe-extra.example"
+    try:
+        got = B._split_hosts(B._env("EXTRA_REDIRECT_DOMAINS",
+                                    B.EXTRA_REDIRECT_DOMAINS))
+        check(got == ("probe-extra.example",),
+              "an EXTRA_* env override parses into a host tuple", str(got))
+    finally:
+        os.environ.pop("EXTRA_REDIRECT_DOMAINS", None)
+
+
+def t_placeholder_is_rejected():
+    print("\n— placeholder credentials are rejected loudly —")
+    saved_token, saved_admins = B.CFG.token, B.CFG.admin_ids
+
+    object.__setattr__(B.CFG, "token", "PASTE_YOUR_BOT_TOKEN_HERE")
+    object.__setattr__(B.CFG, "admin_ids", ())
+    try:
+        check(B.preflight() is False,
+              "the shipped placeholders make preflight fail")
+    finally:
+        object.__setattr__(B.CFG, "token", saved_token)
+        object.__setattr__(B.CFG, "admin_ids", saved_admins)
+
+    object.__setattr__(B.CFG, "token", "not-a-token-no-colon")
+    try:
+        check(B.preflight() is False, "a malformed token (no ':') is rejected")
+    finally:
+        object.__setattr__(B.CFG, "token", saved_token)
+
+    check(B.preflight() is True, "preflight passes again once restored")
+
+
+def t_no_env_file_needed():
+    """The whole point: a bare checkout with no .env still configures itself."""
+    print("\n— runs with no .env present —")
+    check(not os.path.isfile(os.path.join(REPO, ".env")),
+          "the repo ships no .env file at all")
+    src = open(os.path.join(REPO, "shadowlinks_bot.py"), encoding="utf-8").read()
+    check("load_dotenv()" not in src.split("if USE_DOTENV:")[0].split("def load_dotenv")[1]
+          if "if USE_DOTENV:" in src else False,
+          "load_dotenv is called only behind the USE_DOTENV flag")
+    check("if USE_DOTENV:" in src, "the .env loader is opt-in")
 
 
 def main() -> int:

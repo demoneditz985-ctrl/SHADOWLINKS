@@ -4,36 +4,31 @@
 #
 #      bash install-termux.sh
 #
-# ──────────────────────────────────────────────────────────────────────────
-#  WHY THIS IS NOW A SHORT SCRIPT
-# ──────────────────────────────────────────────────────────────────────────
-#  It used to be long, because aiogram 3 depends on pydantic, and pydantic's
-#  compiled core has almost no prebuilt Android (bionic) wheels. On Termux pip
-#  fell through to building pydantic-core from Rust source — ~15 minutes, and
-#  it usually ran the phone out of RAM. That was the error this installer
-#  existed to fight.
+#  This script exists to fix the three things that actually go wrong on a
+#  phone, in the order people hit them:
 #
-#  The bot now runs on python-telegram-bot 22, which depends only on httpx.
-#  Its whole tree is 11 of 13 packages pure Python:
+#  1. WRONG PACKAGE.  `pip install telegram` installs an unrelated 2013
+#     name-squat whose entire source is `print("coming soon...")`. It shadows
+#     the real library, so the bot dies with
+#         ImportError: cannot import name 'Bot' from 'telegram'
+#     The framework is `python-telegram-bot`. Step 5 detects the squat,
+#     removes it, and installs the right thing.
 #
-#      python-telegram-bot, httpx, httpcore, h11, anyio, idna, certifi,
-#      sniffio, typing_extensions, beautifulsoup4, soupsieve, pycparser
+#  2. SHARED STORAGE.  Unzipping into /sdcard/Download or
+#     /storage/emulated/0 puts the project on a FUSE filesystem with no
+#     symlink or execute-bit support. `python -m venv` needs both, so venv
+#     creation fails there — and the SQLite database is unreliable too.
+#     Step 1 detects this and tells you to move the folder into ~.
 #
-#  There is no pydantic anywhere in it, no aiohttp, no Rust, no maturin, and
-#  no need for a third-party wheel index. The only two packages that need
-#  compiling or a platform wheel are:
+#  3. VENV BOOTSTRAP.  Even in the right place, Termux's ensurepip sometimes
+#     fails. Step 4 tries venv, then venv-without-pip, then falls back to
+#     Termux's own Python — which is already an isolated environment, so
+#     installing into it is normal and safe there.
 #
-#      curl_cffi   has a prebuilt android_24 wheel (cp313 and cp314)
-#      cffi        builds from C with clang in seconds — not Rust
-#
-#  So on a current Termux this installs in well under a minute.
-#
-#  The one thing that still bites: curl_cffi's Android wheel is built for
-#  Python 3.13/3.14 only. An un-updated Termux on 3.12 gets no wheel, so step
-#  3 below checks and tells you how to fix it rather than failing obscurely.
-#
-#  Verified: python-telegram-bot 22.8 / httpx 0.28.1 / curl_cffi 0.16.3 /
-#  beautifulsoup4 4.15.0 — full test suite 266/266 passing.
+#  Nothing else here is exotic: python-telegram-bot's dependency tree is 11 of
+#  13 packages pure Python, with no pydantic, no aiohttp, no Rust and no
+#  third-party wheel index. Only curl_cffi needs a platform wheel (android_24
+#  cp313/cp314) and cffi compiles from C in seconds.
 # ══════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
@@ -49,12 +44,39 @@ die()  { printf '\n%s✗ %s%s\n\n' "$C_R" "$*" "$C_0" >&2; exit 1; }
 
 printf '%s🕶  SHADOWLINKS — Termux one-shot installer%s\n' "$C_B" "$C_0"
 
-# ── 1. environment ────────────────────────────────────────────────────────
-say "Checking environment"
+# ── 1. shared storage: the most common reason venv cannot be created ──────
+say "Checking where this folder lives"
+case "$HERE" in
+  /storage/*|/sdcard/*|*/storage/emulated/*)
+      printf '%s\n' "
+    This folder is on ANDROID SHARED STORAGE:
+        $HERE
+
+    That filesystem (FUSE/sdcardfs) does not support symlinks or execute
+    bits, which is why 'python -m venv' fails here — and SQLite is
+    unreliable on it too. This is not a Termux bug and no pip flag fixes it.
+
+    Move the project into Termux's own home directory:
+
+        mkdir -p ~/SHADOWLINKS
+        cp -r \"$HERE\"/. ~/SHADOWLINKS/
+        cd ~/SHADOWLINKS
+        bash install-termux.sh
+
+    (If cp complains about permissions, run 'termux-setup-storage' once,
+     grant the prompt, and try again.)
+" >&2
+      die "refusing to install on shared storage - move the folder to ~ first"
+      ;;
+  *)
+      ok "$HERE"
+      ;;
+esac
+
 case "${PREFIX:-}" in
-  *com.termux*) ok "Termux ($PREFIX)" ;;
+  *com.termux*) ok "Termux detected ($PREFIX)" ;;
   *) warn "PREFIX does not look like Termux. On normal Linux you do not need
-      any of this — just:  pip install -r requirements.txt" ;;
+      any of this - just:  pip install -r requirements.txt" ;;
 esac
 
 ARCH="$(uname -m)"
@@ -63,37 +85,36 @@ case "$ARCH" in
   armv7l|armv8l)  ok "arch armv7   -> android_24_armeabi_v7a wheels" ;;
   x86_64|amd64)   ok "arch x86_64  -> android_24_x86_64 wheels" ;;
   i686|x86)       ok "arch x86     -> android_24_x86 wheels" ;;
-  *)              warn "unknown arch '$ARCH' — letting pip decide" ;;
+  *)              warn "unknown arch '$ARCH' - letting pip decide" ;;
 esac
 
 # ── 2. system packages ────────────────────────────────────────────────────
-# build-essential + libffi are only needed for cffi, curl_cffi's one compiled
-# dependency. It is a small C build, but it does need a compiler.
+# build-essential + libffi are only for cffi, curl_cffi's one compiled
+# dependency: a small C build, but it does need a compiler.
 say "Installing system packages"
-pkg update -y && pkg upgrade -y || die "pkg update failed — check your network"
+pkg update -y && pkg upgrade -y || die "pkg update failed - check your network"
 pkg install -y python build-essential libffi openssl unzip ||
     die "pkg install failed"
-ok "python, build-essential, libffi, openssl, unzip"
 command -v python >/dev/null || die "python not on PATH after install"
 
-# ── 3. Python version — this is the one real gotcha left ──────────────────
-say "Checking Python (curl_cffi's Android wheel is cp313/cp314 only)"
-python --version
 PY="${PY:-python}"
-PYTAG="$("$PY" -c 'import sys;print("cp%d%d"%(sys.version_info[0],sys.version_info[1]))')"
+ok "python, build-essential, libffi, openssl, unzip  ($("$PY" --version 2>&1))"
 
+# ── 3. Python version - the one remaining real gotcha ─────────────────────
+say "Checking Python (curl_cffi's Android wheel is cp313/cp314 only)"
+"$PY" --version
+PYTAG="$("$PY" -c 'import sys;print("cp%d%d"%(sys.version_info[0],sys.version_info[1]))')"
 case "$PYTAG" in
   cp313|cp314|cp315)
-      ok "$PYTAG — curl_cffi has a prebuilt android_24 wheel for this" ;;
+      ok "$PYTAG - curl_cffi has a prebuilt android_24 wheel for this" ;;
   *)
       warn "$PYTAG has no prebuilt curl_cffi wheel for Android."
-      warn "Everything ELSE still installs (all pure Python), but without"
-      warn "curl_cffi there is no Chrome TLS impersonation, so Cloudflare-"
-      warn "protected shorteners — GPLINKS INCLUDED — will return 403."
+      warn "Everything else installs (all pure Python), but without curl_cffi"
+      warn "there is no Chrome TLS impersonation, so Cloudflare-protected"
+      warn "shorteners - GPLINKS INCLUDED - will return 403."
       warn ""
       warn "Fix it by upgrading Termux's Python:"
-      printf '        pkg update -y && pkg upgrade -y\n'
-      printf '        pkg install -y python\n'
+      printf '        pkg update -y && pkg upgrade -y && pkg install -y python\n'
       printf '        python --version        # want 3.13.x or 3.14.x\n'
       printf '      then re-run:  bash install-termux.sh\n\n'
       warn "If pkg will not move you there, get 3.13 from the tur repo:"
@@ -102,108 +123,239 @@ case "$PYTAG" in
       [ -n "${FORCE_OLD_PY:-}" ] || die "Python $PYTAG cannot get curl_cffi on Android.
       Upgrade Python as shown above, or set FORCE_OLD_PY=1 to install anyway
       and accept that GPLinks will 403."
-      warn "FORCE_OLD_PY set — continuing without a working curl_cffi" ;;
+      warn "FORCE_OLD_PY set - continuing without a working curl_cffi" ;;
 esac
 
-# ── 4. virtualenv ─────────────────────────────────────────────────────────
-say "Creating .venv"
-if [ ! -x .venv/bin/python ]; then
-  "$PY" -m venv .venv || die "could not create the venv"
-fi
-.venv/bin/pip install --upgrade pip wheel setuptools >/dev/null 2>&1 ||
-    warn "pip self-upgrade failed (usually harmless, continuing)"
-ok ".venv ready — $(.venv/bin/python --version 2>&1)"
+# ── 4. virtualenv, with fallbacks ─────────────────────────────────────────
+say "Setting up an environment"
+PYBIN=""; PIPCMD=""
 
-PIP=".venv/bin/pip"
+use_system_python() {
+  # Termux is ALREADY an isolated environment (its own $PREFIX, its own
+  # filesystem), so installing into its Python is normal and safe there -
+  # this is what pkg/pip are for. Not the advice you would give on a desktop.
+  PYBIN="$PY"
+  warn "using Termux's own Python instead of a venv"
+  warn "(on Termux that is fine - it is already an isolated environment)"
+}
 
-# ── 5. the dependencies ───────────────────────────────────────────────────
-say "Installing python-telegram-bot, beautifulsoup4, httpx"
-say "  (all pure Python — no compiler, no Rust, no wheel index needed)"
-$PIP install python-telegram-bot beautifulsoup4 httpx ||
-    die "core install failed"
-ok "python-telegram-bot $(.venv/bin/python -c 'import telegram;print(telegram.__version__)' 2>/dev/null || echo '?')"
-
-# curl_cffi separately: it is the only package here that needs a platform
-# wheel, so --only-binary makes pip FAIL LOUDLY instead of trying to compile
-# a C extension that has historically not built on bionic.
-say "Installing curl_cffi (Chrome TLS impersonation — this beats Cloudflare)"
-CFFI=0
-if $PIP install --only-binary=curl_cffi curl_cffi >/dev/null 2>&1; then
-  if .venv/bin/python -c "from curl_cffi.requests import AsyncSession" 2>/dev/null; then
-    CFFI=1; ok "curl_cffi working — GPLinks bypass available"
+if [ -x .venv/bin/python ]; then
+  PYBIN=".venv/bin/python"
+  ok "reusing the existing .venv"
+else
+  if "$PY" -m venv .venv >/tmp/sl_venv.log 2>&1 && [ -x .venv/bin/python ]; then
+    PYBIN=".venv/bin/python"
+    ok ".venv created"
   else
-    warn "curl_cffi installed but will not import"
+    warn "'python -m venv' failed:"
+    sed 's/^/        /' /tmp/sl_venv.log 2>/dev/null | tail -8
+    rm -rf .venv
+    warn "retrying with --without-pip, then bootstrapping pip"
+    if "$PY" -m venv --without-pip .venv >/tmp/sl_venv2.log 2>&1 \
+       && [ -x .venv/bin/python ]; then
+      PYBIN=".venv/bin/python"
+      if "$PYBIN" -m ensurepip --upgrade >/dev/null 2>&1 \
+         || "$PYBIN" -c "import pip" >/dev/null 2>&1; then
+        ok ".venv created (--without-pip), pip bootstrapped"
+      else
+        warn "no pip inside the venv and ensurepip is unavailable"
+        rm -rf .venv; PYBIN=""
+      fi
+    else
+      sed 's/^/        /' /tmp/sl_venv2.log 2>/dev/null | tail -6
+      rm -rf .venv; PYBIN=""
+    fi
+    [ -n "$PYBIN" ] || use_system_python
+  fi
+fi
+
+ensure_pip() {
+  "$PYBIN" -m pip --version >/dev/null 2>&1 && return 0
+  warn "pip is not available for $PYBIN - bootstrapping"
+  "$PYBIN" -m ensurepip --upgrade >/dev/null 2>&1 && return 0
+  die "could not get pip working for $PYBIN.
+      Try:  pkg install -y python-pip"
+}
+ensure_pip
+"$PYBIN" -m pip install -q --upgrade pip wheel setuptools >/dev/null 2>&1 ||
+    warn "pip self-upgrade failed (usually harmless, continuing)"
+ok "pip: $("$PYBIN" -m pip --version 2>&1 | cut -d' ' -f1-2)"
+
+# pip needs either a venv or, on an externally-managed system Python, the
+# override flag. Work it out once.
+PIPX=()
+# A venv reports the BASE interpreter's stdlib, which carries an
+# EXTERNALLY-MANAGED marker it does not itself enforce - so only check the
+# marker when we are NOT in a venv (sys.prefix == sys.base_prefix).
+PEP668="$("$PYBIN" -c '
+import sys, sysconfig, os
+if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+    print("venv")
+else:
+    p = os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED")
+    print("managed" if os.path.isfile(p) else "plain")
+' 2>/dev/null)"
+if [ "$PEP668" = "managed" ]; then
+  PIPX=(--break-system-packages)
+  warn "this Python is PEP 668 'externally managed' - adding --break-system-packages"
+else
+  ok "pip target: ${PEP668:-unknown} (no override flag needed)"
+fi
+
+# ── 5. the wrong 'telegram' package ───────────────────────────────────────
+say "Checking for the name-squatted 'telegram' package"
+WRONG="$("$PYBIN" - <<'PYEOF'
+import importlib.util as u
+spec = u.find_spec("telegram")
+if spec is None:
+    print("absent")
+else:
+    try:
+        import telegram
+        print("real" if hasattr(telegram, "Bot") else "SQUATTED:" + str(getattr(telegram, "__file__", "?")))
+    except Exception as e:
+        print("SQUATTED:" + str(e))
+PYEOF
+)"
+case "$WRONG" in
+  absent)   ok "nothing installed yet - good" ;;
+  real)     ok "python-telegram-bot is already present" ;;
+  SQUATTED*)
+      warn "found the WRONG package: ${WRONG#SQUATTED:}"
+      warn "this is what causes: ImportError: cannot import name 'Bot'"
+      "$PYBIN" -m pip uninstall -y telegram ${PIPX[@]+${PIPX[@]+"${PIPX[@]}"}} >/dev/null 2>&1
+      # pip's metadata can survive the package (legacy setup.py install), and
+      # the leftover telegram/ directory is what actually shadows the real
+      # library. Delete it only when the resolved path is a real site-packages.
+      SP="$("$PYBIN" -c 'import site;print(site.getsitepackages()[0])' 2>/dev/null)"
+      case "$SP" in
+        */site-packages|*/dist-packages)
+            if [ -d "$SP/telegram" ]; then
+              rm -rf "$SP/telegram" "$SP"/telegram-*.egg-info
+              ok "removed the leftover $SP/telegram directory"
+            fi ;;
+        *)  warn "could not resolve site-packages; relying on pip uninstall" ;;
+      esac
+      "$PYBIN" -m pip uninstall -y telegram ${PIPX[@]+${PIPX[@]+"${PIPX[@]}"}} >/dev/null 2>&1
+      # Confirm the shadow is really gone before moving on.
+      if "$PYBIN" -c 'import telegram' 2>/dev/null; then
+        warn "'telegram' still imports - check: $PYBIN -c \"import telegram;print(telegram.__file__)\""
+      else
+        ok "removed the squatted 'telegram'"
+      fi
+      ;;
+esac
+
+# ── 6. the real dependencies ──────────────────────────────────────────────
+say "Installing python-telegram-bot, beautifulsoup4, httpx"
+say "  (all pure Python - no compiler, no Rust, no wheel index needed)"
+"$PYBIN" -m pip install ${PIPX[@]+"${PIPX[@]}"} -U \
+    "python-telegram-bot>=22,<23" beautifulsoup4 httpx \
+    || die "core install failed - see the pip output above"
+ok "python-telegram-bot $("$PYBIN" -c 'import telegram;print(telegram.__version__)' 2>/dev/null || echo '?')"
+
+# The assertion that matters. If this fails, nothing downstream can work, and
+# the message has to say which of the two packages is at fault.
+say "Verifying the framework really imports"
+"$PYBIN" - <<'PYEOF' || die "the framework still will not import.
+  Run these two lines by hand and paste the output into the chat:
+      $PYBIN -m pip uninstall -y telegram
+      $PYBIN -m pip install -U --force-reinstall python-telegram-bot"
+from telegram import Bot, Update, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, filters
+print("    from telegram import Bot  ✓")
+PYEOF
+
+# curl_cffi separately: the only package needing a platform wheel, so
+# --only-binary makes pip FAIL LOUDLY rather than attempt a C build that has
+# historically not worked against bionic.
+say "Installing curl_cffi (Chrome TLS impersonation - this beats Cloudflare)"
+CFFI=0
+if "$PYBIN" -m pip install ${PIPX[@]+"${PIPX[@]}"} --only-binary=curl_cffi curl_cffi \
+        >/tmp/sl_cffi.log 2>&1; then
+  if "$PYBIN" -c "from curl_cffi.requests import AsyncSession" 2>/dev/null; then
+    CFFI=1; ok "curl_cffi working - GPLinks bypass available"
+  else
+    warn "curl_cffi installed but will not import:"
+    sed 's/^/        /' /tmp/sl_cffi.log | tail -5
   fi
 else
   warn "curl_cffi did not install from a wheel (you are on Python $PYTAG)."
+  sed 's/^/        /' /tmp/sl_cffi.log 2>/dev/null | tail -6
   warn "The bot STILL RUNS on the httpx fallback, but without Chrome TLS"
-  warn "impersonation Cloudflare-protected sites — GPLINKS INCLUDED — will 403."
-  warn "Fix: upgrade to Python 3.13/3.14 (see step 3), then re-run this."
+  warn "impersonation Cloudflare sites - GPLINKS INCLUDED - will 403."
+  warn "Fix: upgrade to Python 3.13/3.14 (step 3), then re-run this."
 fi
 
-# ── 6. configuration ──────────────────────────────────────────────────────
-say "Checking .env"
-if [ -f .env ] && grep -qE '^BOT_TOKEN=[0-9]+:' .env; then
-  ok ".env present with a bot token"
-  grep -qE '^ADMIN_IDS=[0-9]+' .env && ok "ADMIN_IDS present" ||
-      warn "ADMIN_IDS missing — add your Telegram user id to .env"
-else
-  warn ".env missing or has no token."
-  if [ ! -f .env ]; then
-    cat > .env <<'EOF'
-BOT_TOKEN=PASTE_TOKEN_FROM_BOTFATHER
-ADMIN_IDS=PASTE_YOUR_TELEGRAM_USER_ID
-EOF
-  fi
-  warn "edit it (nano .env) before starting the bot."
-fi
-
-# ── 7. verify ─────────────────────────────────────────────────────────────
-if [ -f shadowlinks_bot.py ]; then
-  say "Importing the bot"
-  .venv/bin/python - <<'PYEOF' || die "import check failed — see above"
-import shadowlinks_bot as B, telegram, bs4
-print(f"    bot engine   : OK")
-print(f"    framework    : python-telegram-bot {telegram.__version__}")
-print(f"    shorteners   : {len(B.REGISTRY)} domains registered")
-print(f"    http backend : {'curl_cffi (Chrome TLS)' if B.HTTP._cffi_ok else 'httpx — NO Cloudflare bypass'}")
-app = B.build_application()
-print(f"    handlers     : {sum(len(v) for v in app.handlers.values())} registered")
-PYEOF
-  ok "all imports good"
-  say "Running the bot's own self-check"
-  .venv/bin/python shadowlinks_bot.py --check || die "--check failed"
-else
+# ── 7. configuration now lives INSIDE shadowlinks_bot.py ──────────────────
+say "Checking the settings block in shadowlinks_bot.py"
+if [ ! -f shadowlinks_bot.py ]; then
   warn "shadowlinks_bot.py is not in $HERE"
-  warn "Unzip SHADOWLINKS-bot.zip here first, or clone it:"
+  warn "Copy it here first, or clone the repo:"
   printf '        pkg install -y git\n'
   printf '        git clone -b arena/82f542e9-shadowlinks \\\n'
   printf '          https://github.com/demoneditz985-ctrl/SHADOWLINKS.git .\n'
+else
+  # There is no .env any more - the token and admin id are edited in the file.
+  if grep -qE '^BOT_TOKEN *= *"PASTE_YOUR_BOT_TOKEN_HERE"' shadowlinks_bot.py; then
+      warn "BOT_TOKEN is still the placeholder."
+      warn "Open shadowlinks_bot.py and set the two values near the top:"
+      printf '        nano shadowlinks_bot.py\n'
+      printf '      line ~100:  BOT_TOKEN = "123456789:AA..."\n'
+      printf '      line ~105:  ADMIN_IDS = "your numeric user id"\n'
+      warn "Get the token from @BotFather and your id from @userinfobot."
+  elif grep -qE '^BOT_TOKEN *= *"[0-9]+:' shadowlinks_bot.py; then
+      ok "BOT_TOKEN is set"
+      grep -qE '^ADMIN_IDS *= *"[0-9]+' shadowlinks_bot.py \
+        && ok "ADMIN_IDS is set" \
+        || warn "ADMIN_IDS still looks like a placeholder - set it in the file"
+  else
+      warn "could not find a BOT_TOKEN line - check the top of the file"
+  fi
+fi
+
+# ── 8. verify ─────────────────────────────────────────────────────────────
+if [ -f shadowlinks_bot.py ]; then
+  say "Importing the bot"
+  "$PYBIN" - <<'PYEOF' || die "import check failed - see above"
+import shadowlinks_bot as B, telegram, bs4
+print(f"    framework    : python-telegram-bot {telegram.__version__}")
+print(f"    shorteners   : {len(B.REGISTRY)} domains registered")
+print(f"    http backend : {'curl_cffi (Chrome TLS)' if B.HTTP._cffi_ok else 'httpx - NO Cloudflare bypass'}")
+app = B.build_application()
+print(f"    handlers     : {sum(len(v) for v in app.handlers.values())} registered")
+PYEOF
+  say "Running the bot's own self-check"
+  "$PYBIN" shadowlinks_bot.py --check || die "--check failed"
 fi
 
 # ── done ──────────────────────────────────────────────────────────────────
 printf '\n%s\n' "═══════════════════════════════════════════════════════════════════════"
 if [ "$CFFI" = "1" ]; then
-  printf '  %s✅  READY — curl_cffi active, GPLinks bypass available%s\n' "$C_G" "$C_0"
+  printf '  %s✅  READY - curl_cffi active, GPLinks bypass available%s\n' "$C_G" "$C_0"
 else
   printf '  %s⚠   INSTALLED, but without curl_cffi%s\n' "$C_Y" "$C_0"
   printf '  %s    Cloudflare sites (incl. GPLinks) will likely 403.%s\n' "$C_Y" "$C_0"
   printf '  %s    Upgrade to Python 3.13/3.14 and re-run to fix.%s\n' "$C_Y" "$C_0"
 fi
 printf '%s\n\n' "═══════════════════════════════════════════════════════════════════════"
-cat <<'BANNER'
+
+if [ "$PYBIN" = ".venv/bin/python" ]; then RUN=".venv/bin/python shadowlinks_bot.py";
+else RUN="python shadowlinks_bot.py"; fi
+
+cat <<BANNER
   Start the bot:
 
-      cd ~/SHADOWLINKS
+      cd $HERE
       termux-wake-lock
-      .venv/bin/python shadowlinks_bot.py
+      $RUN
 
   Survive closing Termux (tmux):
 
       pkg install -y tmux
       tmux new -s shadow
       termux-wake-lock
-      cd ~/SHADOWLINKS && .venv/bin/python shadowlinks_bot.py
+      cd $HERE && $RUN
         # Ctrl+B then D = detach       tmux attach -t shadow = return
 
   REQUIRED or Android kills it minutes after the screen turns off:
@@ -215,10 +367,9 @@ cat <<'BANNER'
 
   Admin:  /admin   /stats   /addvip <id> 30   /gencode 30 5
 
-  Run the test suite any time:
-      .venv/bin/pip install pyflakes
-      .venv/bin/python tests/test_config.py
-      .venv/bin/python tests/test_resolver.py
-      .venv/bin/python tests/test_ptb.py
+  Run the test suite any time (266 checks, no network needed):
+      ${PYBIN} tests/test_config.py
+      ${PYBIN} tests/test_resolver.py
+      ${PYBIN} tests/test_ptb.py
 ═══════════════════════════════════════════════════════════════════════
 BANNER

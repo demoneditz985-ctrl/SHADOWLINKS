@@ -53,7 +53,7 @@ codes you generate and sell/distribute however you like.
 
 **The entire bot is [`shadowlinks_bot.py`](shadowlinks_bot.py).** No package
 layout, no plugin directory, no build step. Config comes from the environment
-or a `.env` file; state lives in one SQLite file.
+or the SETTINGS block at the top of the file; state lives in one SQLite file.
 
 ---
 
@@ -186,15 +186,33 @@ bash install-termux.sh
 ```
 
 It installs the system packages, builds the venv, installs everything, checks
-that `.env` has a token, and runs the bot's self-check. See
+that `BOT_TOKEN` is set in the file, and runs the bot's self-check. See
 [Termux notes](#termux-on-android) below for why this is now trivial.
 
 ### 3. Configure
 
-```bash
-cp .env.example .env
-nano .env        # set BOT_TOKEN and ADMIN_IDS — the only two required values
+**There is no `.env` file.** Open `shadowlinks_bot.py` and edit the SETTINGS
+block near the top — it is the first thing in the file, under a banner reading
+`EDIT THE BLOCK BELOW`. Two values are required:
+
+```python
+BOT_TOKEN = "123456789:AAH...from @BotFather..."
+ADMIN_IDS = "123456789"        # your numeric id from @userinfobot
 ```
+
+```bash
+nano shadowlinks_bot.py        # or any editor
+```
+
+Every other setting in that block already has a working default. Leave them
+alone unless you want to change a limit.
+
+Environment variables still override the block when set (`BOT_TOKEN=... python
+shadowlinks_bot.py`), which is what the Docker and systemd sections below rely
+on. Nothing else is required — there is no `.env`, no config file and no
+environment setup. If you would rather keep one anyway, set `USE_DOTENV = True`
+in the block and write a `.env` next to the bot; every key listed below works
+there too.
 
 ### 4. Verify
 
@@ -203,7 +221,7 @@ python shadowlinks_bot.py --check
 ```
 
 ```
-SHADOWLINKS v1.0.0
+SHADOWLINKS v1.1.0
   framework        : python-telegram-bot 22.8
   registry domains : 144
   handlers         : ['adfly','auto','form','gplinks','linkvertise','ouo','redirect']
@@ -213,7 +231,15 @@ SHADOWLINKS v1.0.0
   vip batch        : 25 links/message
   admins           : (111111111,)
   token            : set
+  config source    : SETTINGS block in this file (no .env)
 ```
+
+`backend` must say `curl_cffi`. If it says `httpx`, curl_cffi did not install
+and Cloudflare-protected shorteners (GPLinks included) will return 403 — see
+[Termux on Android](#termux-on-android).
+
+With the shipped placeholders still in place, `--check` exits non-zero and
+says `token : PLACEHOLDER - edit this file` instead.
 
 The bot refuses to start with an actionable message if `BOT_TOKEN` or
 `ADMIN_IDS` is missing, rather than dying in a traceback.
@@ -275,8 +301,10 @@ nobody misreads one over a screenshot.
 
 ## Configuration
 
-Every knob is an environment variable (or a line in `.env`). Full annotated
-list in [`.env.example`](.env.example). The ones you will actually touch:
+Every knob is a constant in the SETTINGS block at the top of
+`shadowlinks_bot.py`, and each can also be overridden by an environment
+variable of the same name. The SETTINGS block in the file documents the full
+set, with a comment on every line. The ones you will actually touch:
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -411,7 +439,7 @@ out of date and cannot be updated.
 ## Adding shorteners without redeploying
 
 Shorteners change domain constantly. You do not need to edit code or rebuild —
-put the new hostnames in `.env` and restart:
+put the new hostnames in `EXTRA_*_DOMAINS` in the SETTINGS block and restart:
 
 ```bash
 EXTRA_GPLINKS_DOMAINS=gplinks.newdomain.in,gplinksmirror.co
@@ -450,16 +478,19 @@ chain got — that is usually enough to know which `EXTRA_*` list it belongs in.
 ## Testing
 
 The bot itself stays a single file, but the suite it was developed against
-lives in `tests/` and covers it end to end — **266 checks, all passing**:
+lives in `tests/` and covers it end to end — **294 checks, all passing**:
 
 ```bash
-python tests/test_config.py      # 60  .env parsing, _env_bool/_env_list, preflight
+python tests/test_config.py      # 88  SETTINGS block, no-.env guarantee, preflight
 python tests/test_resolver.py    # 92  HTTP layer + resolver, on BOTH backends
 python tests/test_ptb.py         # 114 dispatcher, commands, callbacks, FSM, VIP
 ```
 
-- **Config** — the `.env` parser against the *actual shipped file*, including
-  the inline-comment case that once silently disabled curl_cffi (see below).
+- **Config** — the SETTINGS block, env-override precedence, the placeholder
+  guard, `_split_hosts`, and an assertion that **no `.env` or config file
+  ships at all**. The optional `USE_DOTENV=True` parser is still covered
+  against a synthetic file, including the inline-comment case that once
+  silently disabled curl_cffi (see below).
 - **HTTP layer** — a real local server on `127.0.0.1`, and every assertion is
   run **twice**: once on `curl_cffi` and once on the `httpx` fallback. The two
   must agree on redirect handling, form-encoding, cookies, referer/origin
@@ -524,9 +555,8 @@ SHADOWLINKS/
 ├── shadowlinks_bot.py    ← the entire bot (~3,300 lines)
 ├── requirements.txt      ← 4 dependencies
 ├── install-termux.sh     ← one-shot Android installer
-├── tests/                ← 266 checks across 3 files (not part of the bot)
-├── .env.example          ← every setting, annotated
-├── .gitignore            ← keeps .env and *.db out of git
+├── tests/                ← 294 checks across 3 files (not part of the bot)
+├── .gitignore            ← keeps *.db and any .env out of git
 └── README.md
 ```
 
