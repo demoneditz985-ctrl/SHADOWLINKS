@@ -96,7 +96,18 @@ def load_dotenv(path: str = ".env") -> None:
                     continue
                 key, val = line.split("=", 1)
                 key = key.strip()
-                val = val.strip().strip('"').strip("'")
+                val = val.strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                    val = val[1:-1]          # quoted -> take verbatim
+                else:
+                    # Strip an inline comment (" # ..."). Without this,
+                    # USE_CURL_CFFI=1  # note  parsed as the whole string,
+                    # which is not "1", so the browser-TLS backend silently
+                    # switched itself off.
+                    cut = re.search(r"\s+#", val)
+                    if cut:
+                        val = val[: cut.start()]
+                    val = val.strip()
                 os.environ.setdefault(key, val)
     except OSError as exc:  # pragma: no cover
         log.warning("could not read %s: %s", here, exc)
