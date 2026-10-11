@@ -1,13 +1,37 @@
-# SHADOWLINKS — runtime dependencies
-# Python 3.10 or newer.
+# ═══════════════════════════════════════════════════════════════════════════
+#  SHADOWLINKS dependencies
 #
-#   pip install -r requirements.txt
+#  Install normally:      pip install -r requirements.txt
+#  Install on Termux:     bash install-termux.sh   (handles the Android wheels)
 #
-# curl_cffi is what gets past Cloudflare: it impersonates a real Chrome TLS/JA3
-# fingerprint. aiohttp is only the automatic fallback if curl_cffi cannot be
-# installed on your platform — everything still works, some sites just 403.
+#  ── why pydantic is pinned here ─────────────────────────────────────────
+#  aiogram 3.31 requires `pydantic<2.14,>=2.4.1`. The newest pydantic that
+#  satisfies that is 2.13.5, which pins pydantic-core==2.46.5 — a version with
+#  NO prebuilt Android/bionic wheel on any index. On Termux that forces a
+#  Rust source build that typically fails or exhausts phone RAM.
+#
+#  pydantic 2.12.5 pins pydantic-core 2.41.5, which IS prebuilt for Android
+#  (cp313 + cp314, arm64_v8a / armeabi_v7a / x86 / x86_64) on the Termux
+#  user-repository index. It also satisfies aiogram's constraint.
+#
+#  Pinning it here makes one requirements file work on desktop Linux, a VPS,
+#  and native Termux alike. Verified: pydantic 2.12.5 / pydantic-core 2.41.5 /
+#  aiogram 3.31.0 / aiohttp 3.14.5 / curl_cffi 0.16.3 / bs4 4.15.0, 76/76
+#  tests passing.
+# ═══════════════════════════════════════════════════════════════════════════
 
 aiogram>=3.13,<4.0
-curl_cffi>=0.7.0
-beautifulsoup4>=4.12
+
+# Pinned as a pair — do not bump one without the other. See the note above.
+pydantic==2.12.5
+pydantic-core==2.41.5
+
 aiohttp>=3.9
+beautifulsoup4>=4.12
+
+# Chrome TLS fingerprint impersonation. This is what defeats the Cloudflare
+# shield sitting in front of GPLinks and most other ad-link shorteners —
+# without it those sites return 403. The bot degrades gracefully to aiohttp
+# if this fails to install, but GPLinks resolution will then fail.
+# On Termux it needs Python 3.13/3.14 for the prebuilt Android wheel.
+curl_cffi>=0.7
