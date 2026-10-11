@@ -1,0 +1,13 @@
+# SHADOWLINKS — runtime dependencies
+# Python 3.10 or newer.
+#
+#   pip install -r requirements.txt
+#
+# curl_cffi is what gets past Cloudflare: it impersonates a real Chrome TLS/JA3
+# fingerprint. aiohttp is only the automatic fallback if curl_cffi cannot be
+# installed on your platform — everything still works, some sites just 403.
+
+aiogram>=3.13,<4.0
+curl_cffi>=0.7.0
+beautifulsoup4>=4.12
+aiohttp>=3.9

@@ -1,0 +1,23 @@
+# secrets
+.env
+*.env
+!.env.example
+
+# runtime database (SQLite + WAL sidecars)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
