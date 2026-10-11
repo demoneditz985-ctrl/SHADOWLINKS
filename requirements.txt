@@ -2,36 +2,42 @@
 #  SHADOWLINKS dependencies
 #
 #  Install normally:      pip install -r requirements.txt
-#  Install on Termux:     bash install-termux.sh   (handles the Android wheels)
+#  Install on Termux:     bash install-termux.sh   (one shot, handles Android)
 #
-#  ── why pydantic is pinned here ─────────────────────────────────────────
-#  aiogram 3.31 requires `pydantic<2.14,>=2.4.1`. The newest pydantic that
-#  satisfies that is 2.13.5, which pins pydantic-core==2.46.5 — a version with
-#  NO prebuilt Android/bionic wheel on any index. On Termux that forces a
-#  Rust source build that typically fails or exhausts phone RAM.
+#  ── why the framework is python-telegram-bot and not aiogram ───────────
+#  aiogram 3 depends on pydantic, whose compiled core (pydantic-core) has no
+#  Android/bionic wheel for most releases — on Termux that means a Rust build
+#  that either fails or exhausts phone RAM. aiogram 3.31 also caps
+#  `pydantic<2.14`, which excludes the one pydantic release that DOES have an
+#  Android wheel, so there is no clean way out.
 #
-#  pydantic 2.12.5 pins pydantic-core 2.41.5, which IS prebuilt for Android
-#  (cp313 + cp314, arm64_v8a / armeabi_v7a / x86 / x86_64) on the Termux
-#  user-repository index. It also satisfies aiogram's constraint.
+#  python-telegram-bot 22 depends only on httpx. Its whole tree is 11 of 13
+#  packages pure Python, with no pydantic and no aiohttp anywhere in it.
 #
-#  Pinning it here makes one requirements file work on desktop Linux, a VPS,
-#  and native Termux alike. Verified: pydantic 2.12.5 / pydantic-core 2.41.5 /
-#  aiogram 3.31.0 / aiohttp 3.14.5 / curl_cffi 0.16.3 / bs4 4.15.0, 76/76
-#  tests passing.
+#  ── the resulting install on Android arm64 ────────────────────────────
+#    pure python (11) : python-telegram-bot, httpx, httpcore, h11, anyio,
+#                       idna, certifi, sniffio*, typing_extensions,
+#                       beautifulsoup4, soupsieve, pycparser
+#    platform wheel   : curl_cffi  -> HAS android_24 cp313/cp314 wheels
+#    compiled from C  : cffi       -> seconds with clang, not a Rust build
+#
+#  No Rust. No maturin. No extra wheel index. Verified: python-telegram-bot
+#  22.8 / httpx 0.28.1 / curl_cffi 0.16.3 / beautifulsoup4 4.15.0 — the full
+#  suite passes 266/266.
 # ═══════════════════════════════════════════════════════════════════════════
 
-aiogram>=3.13,<4.0
+python-telegram-bot>=22.0,<23.0
 
-# Pinned as a pair — do not bump one without the other. See the note above.
-pydantic==2.12.5
-pydantic-core==2.41.5
-
-aiohttp>=3.9
 beautifulsoup4>=4.12
 
 # Chrome TLS fingerprint impersonation. This is what defeats the Cloudflare
 # shield sitting in front of GPLinks and most other ad-link shorteners —
-# without it those sites return 403. The bot degrades gracefully to aiohttp
-# if this fails to install, but GPLinks resolution will then fail.
+# without it those sites return 403. The bot degrades gracefully to httpx if
+# this fails to install, but GPLinks resolution will then fail.
 # On Termux it needs Python 3.13/3.14 for the prebuilt Android wheel.
 curl_cffi>=0.7
+
+# httpx is pulled in by python-telegram-bot and doubles as the resolver's
+# fallback HTTP backend, so it is listed explicitly rather than relied on
+# transitively. Pure Python — no platform wheel on any OS.
+httpx>=0.27,<0.29

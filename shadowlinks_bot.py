@@ -11,7 +11,7 @@
 ║   Plus 70+ other shorteners + a universal auto-detect engine for any     ║
 ║   domain that is not in the built-in table.                              ║
 ║                                                                          ║
-║   Stack  : Python 3.10+ · aiogram 3 · curl_cffi (Chrome TLS              ║
+║   Stack  : Python 3.10+ · python-telegram-bot 22 · curl_cffi (Chrome TLS ║
 ║            impersonation, beats Cloudflare) · BeautifulSoup4 · sqlite3   ║
 ║   Run    : python shadowlinks_bot.py                                     ║
 ║   Config : environment variables or a .env file next to this script      ║
@@ -20,7 +20,7 @@
 CONTENTS
   §1  Config / .env loader
   §2  Database (sqlite3)
-  §3  HTTP client abstraction (curl_cffi primary, aiohttp fallback)
+  §3  HTTP client abstraction (curl_cffi primary, httpx fallback)
   §4  Shortener registry (70+ domains)
   §5  Resolver engine  (redirect / form / meta / js / adfly / graphql)
   §6  Telegram keyboards & text templates
@@ -35,7 +35,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import functools
 import html
+import inspect
 import ipaddress
 import json
 import logging
@@ -55,15 +57,9 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
-from aiogram import BaseMiddleware, Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatAction, ContentType, ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.filters import Command, CommandObject
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
+import telegram
+from telegram import (
+    Bot,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -71,9 +67,25 @@ from aiogram.types import (
     LinkPreviewOptions,
     Message,
     ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest, Forbidden, RetryAfter
+from telegram.ext import (
+    Application,
+    CallbackContext,
+    CallbackQueryHandler,
+    CommandHandler,
+    Defaults,
+    MessageHandler,
+    filters,
 )
 
-__version__ = "1.0.0"
+# Printed by --check so a mis-installed framework is obvious at a glance.
+# PTB exposes __version__, not VERSION.
+telegram_ver = getattr(telegram, "__version__", "unknown")
+
+__version__ = "1.1.0"
 __app__ = "SHADOWLINKS"
 
 log = logging.getLogger("shadowlinks")
@@ -684,19 +696,23 @@ class HttpClient:
 
     curl_cffi impersonates a browser at the TLS layer, which is what gets
     past the Cloudflare challenge most Indian shorteners sit behind.
-    Falls back to aiohttp if curl_cffi is unavailable or errors out.
+    Falls back to httpx if curl_cffi is unavailable or errors out.
+
+    httpx rather than aiohttp: it is already a dependency of
+    python-telegram-bot and is pure Python, so the fallback costs nothing
+    extra to install. aiohttp drags in multidict/yarl/frozenlist/propcache,
+    none of which publish Android wheels.
     """
 
     def __init__(self) -> None:
         self._cffi_ok = CFG.use_curl_cffi
-        self._aiohttp = None
         if self._cffi_ok:
             try:
                 import curl_cffi.requests
                 if not callable(curl_cffi.requests.AsyncSession):
                     raise RuntimeError("curl_cffi.requests.AsyncSession missing")
             except Exception as exc:  # pragma: no cover
-                log.warning("curl_cffi unavailable (%s) - falling back to aiohttp", exc)
+                log.warning("curl_cffi unavailable (%s) - falling back to httpx", exc)
                 self._cffi_ok = False
 
     # -- session ----------------------------------------------------------
@@ -707,17 +723,24 @@ class HttpClient:
             async with AsyncSession(impersonate=CFG.impersonate) as s:
                 yield _CffiSession(s)
                 return
-        if self._aiohttp is None or self._aiohttp.closed:
-            import aiohttp
-            self._aiohttp = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=CFG.http_timeout),
-                connector=aiohttp.TCPConnector(limit=CFG.concurrency * 2, ssl=False),
-            )
-        yield _AiohttpSession(self._aiohttp)
+        import httpx
+        # A fresh client per resolve, mirroring the curl_cffi branch above. One
+        # session() covers a whole redirect-chain walk, so keep-alive is still
+        # used where it actually matters, and no client ever outlives the event
+        # loop that created it.
+        async with httpx.AsyncClient(
+            timeout=CFG.http_timeout,
+            limits=httpx.Limits(max_connections=CFG.concurrency * 2,
+                                max_keepalive_connections=CFG.concurrency),
+            max_redirects=CFG.max_hops,
+            verify=False,
+        ) as client:
+            yield _HttpxSession(client)
 
     async def close(self) -> None:
-        if self._aiohttp is not None and not self._aiohttp.closed:
-            await self._aiohttp.close()
+        # Nothing to tear down now: both backends open and close their client
+        # inside session(). Retained because on_shutdown() calls it.
+        return None
 
 
 class _CffiSession:
@@ -774,8 +797,8 @@ class _CffiSession:
         return await self.request("POST", url, **kw)
 
 
-class _AiohttpSession:
-    """Fallback path - plain aiohttp, no TLS impersonation."""
+class _HttpxSession:
+    """Fallback path - plain httpx, no TLS impersonation."""
 
     def __init__(self, s) -> None:
         self.s = s
@@ -785,7 +808,6 @@ class _AiohttpSession:
                       referer: str | None = None, cookies: dict | None = None,
                       timeout: float | None = None,
                       params: dict | None = None) -> Response:
-        import aiohttp
         parsed = urlparse(url)
         await guard_host(parsed.hostname or "")
         h = {"user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -795,21 +817,25 @@ class _AiohttpSession:
             h["referer"] = referer
             h["origin"] = f"{parsed.scheme}://{parsed.netloc}"
         try:
-            async with self.s.request(
-                method, url, headers=h, data=data, cookies=cookies, params=params,
-                allow_redirects=allow_redirects,
-                max_redirects=CFG.max_hops if allow_redirects else None,
-                timeout=aiohttp.ClientTimeout(total=timeout or CFG.http_timeout),
-                ssl=False,
-            ) as r:
-                raw = await r.read()
-                body = raw[: CFG.max_body_bytes].decode("utf-8", "replace")
-                jar = {c.key: c.value for c in r.cookies.values()}
-                return Response(
-                    url=url, status=r.status,
-                    headers={k.lower(): v for k, v in r.headers.items()},
-                    text=body, cookies=jar, final_url=str(r.url),
-                )
+            kw: dict[str, Any] = {
+                "headers": h,
+                "follow_redirects": allow_redirects,
+                "timeout": timeout or CFG.http_timeout,
+            }
+            if params:
+                kw["params"] = params
+            if data is not None:
+                kw["data"] = data
+            if cookies:
+                kw["cookies"] = cookies
+            r = await self.s.request(method, url, **kw)
+            body = (r.text or "")[: CFG.max_body_bytes]
+            jar = {k: v for k, v in r.cookies.items()}
+            return Response(
+                url=url, status=r.status_code,
+                headers={k.lower(): v for k, v in r.headers.items()},
+                text=body, cookies=jar, final_url=str(r.url),
+            )
         except Exception as exc:
             return Response(url=url, status=0, headers={}, text="",
                             error=f"{type(exc).__name__}: {exc}")
@@ -2256,41 +2282,145 @@ def group_sites() -> str:
 # ══════════════════════════════════════════════════════════════════════════
 # §7  BOT PLUMBING
 # ══════════════════════════════════════════════════════════════════════════
+#
+#  Ported off aiogram 3 onto python-telegram-bot 22. Two design notes:
+#
+#  1. Handler bodies keep their original signatures - `message=`, `user=`,
+#     `command=`, `state=`, `c=`. The `tg()` adapter below inspects each
+#     handler and passes only the objects it actually declares, so none of
+#     the ~40 handlers below had to be reshaped for PTB's fixed
+#     (update, context) calling convention.
+#
+#  2. python-telegram-bot defaults to SERIAL update processing
+#     (max_concurrent_updates=1, handler block=True). A single GPLinks
+#     resolve can take 15+ seconds, which under those defaults would freeze
+#     every other user for its whole duration. `concurrent_updates(True)`
+#     below is therefore load-bearing, not a tuning nicety.
+# ══════════════════════════════════════════════════════════════════════════
 
-class BotStates(StatesGroup):
-    broadcasting = State()
-    batch = State()
-    awaiting_user = State()
+_STATE: dict[int, dict[str, Any]] = {}
 
 
-class UserMiddleware(BaseMiddleware):
-    """Attach the DB user record to every event, and enforce the ban list.
+class BotStates:
+    """Conversational states, as plain strings.
 
-    Registered on the message and callback_query observers (not on `update`),
-    because an Update object carries no `from_user` - only its inner event does.
+    aiogram's `State()` objects were string-comparable, so handler code like
+    `await state.get_state() == BotStates.batch` reads exactly as it did.
     """
 
-    async def __call__(self, handler, event, data):
-        tg_user = getattr(event, "from_user", None)
-        if tg_user is None:                      # channel post, chat member, …
-            return await handler(event, data)
+    broadcasting = "broadcasting"
+    batch = "batch"
+    awaiting_user = "awaiting_user"
 
-        src = event.message if isinstance(event, CallbackQuery) else event
-        chat = getattr(src, "chat", None)
-        chat_id = getattr(chat, "id", None) or tg_user.id
 
+class StateContext:
+    """Per-user FSM context exposing the same async API as aiogram's FSMContext.
+
+    Backed by an in-memory dict, exactly like aiogram's MemoryStorage: state
+    does not survive a restart. Both conversations that use it (/batch and
+    /broadcast) are re-startable by the user, so that costs nothing.
+    """
+
+    __slots__ = ("_key",)
+
+    def __init__(self, key: int) -> None:
+        self._key = key
+
+    def _slot(self) -> dict[str, Any]:
+        return _STATE.setdefault(self._key, {"state": None, "data": {}})
+
+    async def set_state(self, state: Optional[str]) -> None:
+        self._slot()["state"] = state
+
+    async def get_state(self) -> Optional[str]:
+        return _STATE.get(self._key, {}).get("state")
+
+    async def update_data(self, **kw: Any) -> None:
+        self._slot()["data"].update(kw)
+
+    async def get_data(self) -> dict[str, Any]:
+        return self._slot()["data"]
+
+    async def clear(self) -> None:
+        _STATE.pop(self._key, None)
+
+
+@dataclass(frozen=True)
+class CommandArgs:
+    """Drop-in for aiogram's CommandObject - handlers read `.args` as a STRING.
+
+    python-telegram-bot hands over `context.args` as a LIST; aiogram handed
+    over the raw remainder as a string. Re-joining reproduces the old value,
+    so multi-word arguments (/broadcast hello world) survive unchanged.
+    """
+
+    args: str = ""
+
+
+def tg(fn):
+    """Adapt a SHADOWLINKS handler to python-telegram-bot's (update, context).
+
+    Also does the job aiogram's UserMiddleware did: resolve the DB user
+    record for the sender and enforce the ban list before the handler runs.
+    """
+    params = inspect.signature(fn).parameters
+
+    @functools.wraps(fn)
+    async def wrapper(update: Update, context: CallbackContext) -> Any:
+        msg = update.effective_message
+        tg_user = update.effective_user
+        if msg is None or tg_user is None or tg_user.is_bot:
+            return                                   # channel post, service msg, …
+
+        chat = update.effective_chat
         user = DB.upsert_user(tg_user.id, tg_user.username or "",
-                              tg_user.first_name or "", chat_id)
-        data["user"] = user
-
+                              tg_user.first_name or "",
+                              chat.id if chat else tg_user.id)
         if user.is_banned:
-            if isinstance(event, CallbackQuery):
-                await event.answer("🚫 Blocked.", show_alert=True)
-            else:
-                with contextlib.suppress(Exception):
-                    await event.answer("🚫 You are blocked from using this bot.")
+            await _blocked(update, msg)
             return None
-        return await handler(event, data)
+
+        kw: dict[str, Any] = {}
+        if "message" in params:
+            kw["message"] = msg
+        if "user" in params:
+            kw["user"] = user
+        if "command" in params:
+            kw["command"] = CommandArgs(" ".join(context.args or []))
+        if "state" in params:
+            kw["state"] = StateContext(tg_user.id)
+        if "c" in params:
+            kw["c"] = update.callback_query
+        return await fn(**kw)
+
+    return wrapper
+
+
+async def _blocked(update: Update, msg: Message) -> None:
+    q = update.callback_query
+    if q is not None:
+        with contextlib.suppress(Exception):
+            await q.answer("🚫 Blocked.", show_alert=True)
+        return
+    with contextlib.suppress(Exception):
+        await msg.reply_text("🚫 You are blocked from using this bot.")
+
+
+class _StateFilter(filters.MessageFilter):
+    """PTB has no built-in FSM, so state gating is just a filter over _STATE.
+
+    Note: a MessageFilter receives `update.effective_message`, not the Update.
+    """
+
+    def __init__(self, state: str) -> None:
+        super().__init__(name=f"state:{state}")
+        self._state = state
+
+    def filter(self, message: Message) -> bool:
+        u = message.from_user
+        if u is None:
+            return False
+        return _STATE.get(u.id, {}).get("state") == self._state
 
 
 def quota_line(user: User) -> str:
@@ -2300,14 +2430,14 @@ def quota_line(user: User) -> str:
 
 async def send(msg: Message, text: str, **kw) -> Optional[Message]:
     try:
-        return await msg.answer(text, **kw)
-    except TelegramRetryAfter as e:
+        return await msg.reply_text(text, **kw)
+    except RetryAfter as e:
         await asyncio.sleep(e.retry_after + 0.4)
-        return await msg.answer(text, **kw)
-    except TelegramBadRequest:
+        return await msg.reply_text(text, **kw)
+    except BadRequest:
         kw.pop("reply_markup", None)
         kw.pop("parse_mode", None)
-        return await msg.answer(text, **kw)
+        return await msg.reply_text(text, **kw)
 
 
 async def guard_quota(message: Message, user: User) -> bool:
@@ -2346,9 +2476,10 @@ async def do_resolve(message: Message, user: User, url: str,
     prof = profile_for(url)
     if not quiet:
         with contextlib.suppress(Exception):
-            await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+            await message.get_bot().send_chat_action(message.chat.id,
+                                                    ChatAction.TYPING)
         with contextlib.suppress(Exception):
-            progress = await message.answer(
+            progress = await message.reply_text(
                 f"⏳ <b>Unlocking</b> <code>{esc(host_of(url))}</code>\n"
                 f"⚙️ strategy <code>{esc(prof.handler)}</code> — walking the redirect "
                 f"chain, clearing the ad gate…\n<i>This can take ~15s on sites with "
@@ -2391,7 +2522,7 @@ async def do_resolve(message: Message, user: User, url: str,
 
 # ── public commands ────────────────────────────────────────────────────────
 
-async def cmd_start(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_start(message: Message, user: User, command: CommandArgs) -> None:
     arg = (command.args or "").strip() if command else ""
     if arg and re.match(r"^[A-Za-z0-9_-]{4,}$", arg):
         ok, note, days = DB.redeem_code(arg, user.user_id)
@@ -2448,7 +2579,7 @@ async def cmd_sites(message: Message, user: User) -> None:
     await send(message, TXT_SITES.format(count=len(REGISTRY), groups=group_sites()))
 
 
-async def cmd_redeem(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_redeem(message: Message, user: User, command: CommandArgs) -> None:
     code = (command.args or "").strip() if command else ""
     if not code:
         await send(message, "🎟 Send it as <pre>/redeem SHADOW-XXXXXX</pre>\n"
@@ -2463,7 +2594,7 @@ async def cmd_redeem(message: Message, user: User, command: CommandObject) -> No
                reply_markup=InlineKeyboardMarkup(inline_keyboard=[vip_button_row(user)]))
 
 
-async def cmd_resolve(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_resolve(message: Message, user: User, command: CommandArgs) -> None:
     args = (command.args or "").strip() if command else ""
     urls = extract_urls(args)
     if not urls:
@@ -2510,7 +2641,7 @@ async def cb_copy(c: CallbackQuery, user: User) -> None:
     if not r.ok:
         return await c.answer("Nothing to copy for a failed resolve.", show_alert=True)
     with contextlib.suppress(Exception):
-        await c.message.answer(f"<code>{esc(r.final_url)}</code>")
+        await c.message.reply_text(f"<code>{esc(r.final_url)}</code>")
     await c.answer("Copied to chat ✅")
 
 
@@ -2534,7 +2665,7 @@ async def cb_chain(c: CallbackQuery, user: User) -> None:
     lines += ["", f"⏱ total {r.elapsed_ms / 1000:.2f}s · strategy "
                   f"<code>{esc(r.handler)}</code>"]
     with contextlib.suppress(Exception):
-        await c.message.answer("\n".join(lines)[:4000])
+        await c.message.reply_text("\n".join(lines)[:4000])
     await c.answer()
 
 
@@ -2557,7 +2688,8 @@ async def cb_menu(c: CallbackQuery, user: User) -> None:
     if not isinstance(msg, Message):
         return await c.answer()
     if what == "sites":
-        await msg.answer(TXT_SITES.format(count=len(REGISTRY), groups=group_sites()))
+        await msg.reply_text(TXT_SITES.format(count=len(REGISTRY),
+                                              groups=group_sites()))
     elif what == "help":
         await cmd_help(msg, user)
     await c.answer()
@@ -2633,7 +2765,7 @@ async def replace_or_send(progress: Optional[Message], message: Message,
 
 # ── batch FSM ─────────────────────────────────────────────────────────────
 
-async def cmd_batch(message: Message, user: User, state: FSMContext) -> None:
+async def cmd_batch(message: Message, user: User, state: StateContext) -> None:
     if not user.is_vip:
         return await send(message, "📦 <b>Batch mode is VIP-only.</b>\n\n"
                                    "Free accounts resolve one link per message.\n"
@@ -2647,7 +2779,7 @@ async def cmd_batch(message: Message, user: User, state: FSMContext) -> None:
                         "Finish with /done · abort with /cancel")
 
 
-async def cmd_done(message: Message, user: User, state: FSMContext) -> None:
+async def cmd_done(message: Message, user: User, state: StateContext) -> None:
     data = await state.get_data()
     urls = list(dict.fromkeys(data.get("urls") or []))
     await state.clear()
@@ -2659,7 +2791,7 @@ async def cmd_done(message: Message, user: User, state: FSMContext) -> None:
     await replace_or_send(progress, message, fmt_batch(results, user)[:4000])
 
 
-async def cmd_cancel(message: Message, user: User, state: FSMContext) -> None:
+async def cmd_cancel(message: Message, user: User, state: StateContext) -> None:
     st = await state.get_state()
     await state.clear()
     await send(message, "✅ Cancelled." if st else "Nothing was in progress.")
@@ -2667,7 +2799,7 @@ async def cmd_cancel(message: Message, user: User, state: FSMContext) -> None:
 
 # ── plain text (the main interface) ───────────────────────────────────────
 
-async def on_text(message: Message, user: User, state: FSMContext) -> None:
+async def on_text(message: Message, user: User, state: StateContext) -> None:
     text = (message.text or "").strip()
 
     if await state.get_state() == BotStates.batch:
@@ -2738,14 +2870,14 @@ async def deny(message: Message) -> None:
     await send(message, "🔒 That command is for bot administrators only.")
 
 
-async def admin_target(message: Message, command: CommandObject,
+async def admin_target(message: Message, command: CommandArgs,
                        verb: str) -> Optional[User]:
     args = (command.args or "").split() if command else []
     if not args:
         await send(message, f"Usage: <pre>/{verb} &lt;user id or @username&gt; "
                             f"[days]</pre>")
         return None
-    tid = await target_id(message.bot, args[0])
+    tid = await target_id(message.get_bot(), args[0])
     if tid is None:
         await send(message, f"❓ Could not resolve <code>{esc(args[0])}</code>. "
                             f"Use a numeric user ID, or make sure they have "
@@ -2754,7 +2886,7 @@ async def admin_target(message: Message, command: CommandObject,
     return DB.upsert_user(tid)
 
 
-async def cmd_addvip(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_addvip(message: Message, user: User, command: CommandArgs) -> None:
     if not is_admin(user):
         return await deny(message)
     args = (command.args or "").split() if command else []
@@ -2774,7 +2906,7 @@ async def cmd_addvip(message: Message, user: User, command: CommandObject) -> No
                         f"⏳ <b>{updated.vip_label()}</b>")
 
 
-async def cmd_delvip(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_delvip(message: Message, user: User, command: CommandArgs) -> None:
     if not is_admin(user):
         return await deny(message)
     tgt = await admin_target(message, command, "delvip")
@@ -2804,7 +2936,7 @@ async def cmd_listvip(message: Message, user: User) -> None:
     await send(message, "\n".join(lines)[:4000])
 
 
-async def cmd_gencode(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_gencode(message: Message, user: User, command: CommandArgs) -> None:
     if not is_admin(user):
         return await deny(message)
     args = (command.args or "").split() if command else []
@@ -2833,7 +2965,7 @@ async def cmd_codes(message: Message, user: User) -> None:
     await send(message, "\n".join(lines)[:4000])
 
 
-async def cmd_revoke(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_revoke(message: Message, user: User, command: CommandArgs) -> None:
     if not is_admin(user):
         return await deny(message)
     code = ((command.args or "") if command else "").strip()
@@ -2844,15 +2976,15 @@ async def cmd_revoke(message: Message, user: User, command: CommandObject) -> No
                         if ok else "❓ No such code.")
 
 
-async def cmd_ban(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_ban(message: Message, user: User, command: CommandArgs) -> None:
     await _ban_impl(message, user, command, True)
 
 
-async def cmd_unban(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_unban(message: Message, user: User, command: CommandArgs) -> None:
     await _ban_impl(message, user, command, False)
 
 
-async def _ban_impl(message: Message, user: User, command: CommandObject,
+async def _ban_impl(message: Message, user: User, command: CommandArgs,
                     ban: bool) -> None:
     if not is_admin(user):
         return await deny(message)
@@ -2866,15 +2998,15 @@ async def _ban_impl(message: Message, user: User, command: CommandObject,
                         f"<code>{tgt.user_id}</code>.")
 
 
-async def cmd_setadmin(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_setadmin(message: Message, user: User, command: CommandArgs) -> None:
     await _setadmin_impl(message, user, command, True)
 
 
-async def cmd_unsetadmin(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_unsetadmin(message: Message, user: User, command: CommandArgs) -> None:
     await _setadmin_impl(message, user, command, False)
 
 
-async def _setadmin_impl(message: Message, user: User, command: CommandObject,
+async def _setadmin_impl(message: Message, user: User, command: CommandArgs,
                          grant: bool) -> None:
     if user.user_id not in CFG.admin_ids and not user.is_admin:
         return await deny(message)
@@ -2902,7 +3034,7 @@ async def cmd_stats(message: Message, user: User) -> None:
         f"🕐 Last 24h     : {s['today']}",
         f"⏱ Avg success   : {s['avg_ms']} ms", "",
         f"🧩 Registry     : {len(REGISTRY)} domains",
-        f"⚙️ Backend      : {'curl_cffi' if HTTP._cffi_ok else 'aiohttp'} "
+        f"⚙️ Backend      : {'curl_cffi' if HTTP._cffi_ok else 'httpx'} "
         f"(impersonate={esc(CFG.impersonate)})",
     ]
     top = DB.top_domains(8)
@@ -2915,7 +3047,7 @@ async def cmd_stats(message: Message, user: User) -> None:
     await send(message, "\n".join(lines)[:4000])
 
 
-async def cmd_logs(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_logs(message: Message, user: User, command: CommandArgs) -> None:
     if not is_admin(user):
         return await deny(message)
     args = (command.args or "").split() if command else []
@@ -2948,7 +3080,7 @@ async def cmd_delays(message: Message, user: User) -> None:
     await send(message, "\n".join(lines)[:4000])
 
 
-async def cmd_setdelay(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_setdelay(message: Message, user: User, command: CommandArgs) -> None:
     if not is_admin(user):
         return await deny(message)
     args = (command.args or "").split() if command else []
@@ -2966,7 +3098,7 @@ async def cmd_setdelay(message: Message, user: User, command: CommandObject) -> 
                         f"{'on' if CFG.adaptive_delay else 'off'}.</i>")
 
 
-async def cmd_whois(message: Message, user: User, command: CommandObject) -> None:
+async def cmd_whois(message: Message, user: User, command: CommandArgs) -> None:
     if not is_admin(user):
         return await deny(message)
     tgt = await admin_target(message, command, "whois")
@@ -2988,8 +3120,8 @@ async def cmd_whois(message: Message, user: User, command: CommandObject) -> Non
           f"\n🚫 banned {'yes' if tgt.is_banned else 'no'}")
 
 
-async def cmd_broadcast(message: Message, user: User, command: CommandObject,
-                        state: FSMContext) -> None:
+async def cmd_broadcast(message: Message, user: User, command: CommandArgs,
+                        state: StateContext) -> None:
     if not is_admin(user):
         return await deny(message)
     text = (command.args or "").strip() if command else ""
@@ -3004,19 +3136,18 @@ async def run_broadcast(message: Message, text: str) -> None:
     ids = DB.all_user_ids()
     if not ids:
         return await send(message, "Nobody to broadcast to yet.")
+    bot = message.get_bot()
     ok = fail = 0
     for i, uid in enumerate(ids, 1):
         try:
-            await message.bot.send_message(uid, f"📣 {text}",
-                                           disable_notification=True)
+            await bot.send_message(uid, f"📣 {text}", disable_notification=True)
             ok += 1
-        except TelegramForbiddenError:
+        except Forbidden:
             fail += 1
-        except TelegramRetryAfter as e:
+        except RetryAfter as e:
             await asyncio.sleep(e.retry_after + 0.5)
             with contextlib.suppress(Exception):
-                await message.bot.send_message(uid, f"📣 {text}",
-                                               disable_notification=True)
+                await bot.send_message(uid, f"📣 {text}", disable_notification=True)
                 ok += 1
         except Exception:
             fail += 1
@@ -3026,7 +3157,8 @@ async def run_broadcast(message: Message, text: str) -> None:
                         f"\n👥 audience {len(ids)}")
 
 
-async def on_broadcast_text(message: Message, user: User, state: FSMContext) -> None:
+async def on_broadcast_text(message: Message, user: User,
+                            state: StateContext) -> None:
     if not is_admin(user):
         await state.clear()
         return await deny(message)
@@ -3078,86 +3210,92 @@ async def on_non_text(message: Message, user: User) -> None:
                         "<pre>https://gplinks.co/BFfOX</pre>")
 
 
-async def on_error(event, exception: Optional[Exception] = None, **kwargs) -> bool:
+async def on_error(update: object, context: CallbackContext) -> None:
     """Last line of defence: log it, never crash the polling loop."""
-    exc = exception or kwargs.get("exception") or getattr(event, "exception", None)
+    exc = context.error
     log.error("unhandled update error: %s", exc, exc_info=exc)
-    return True
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # §10  ENTRYPOINT
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_dispatcher() -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage())
-    user_mw = UserMiddleware()
-    dp.message.middleware(user_mw)
-    dp.callback_query.middleware(user_mw)
+def register_handlers(app: Application) -> int:
+    """Attach every handler. Registration ORDER is semantic: python-telegram-bot
+    runs at most one handler per group per update, so the first match wins -
+    the same contract aiogram's observers had.
+    """
+    add = app.add_handler
 
-    # public
-    dp.message.register(cmd_start, Command("start"))
-    dp.message.register(cmd_help, Command("help"))
-    dp.message.register(cmd_plans, Command("plans"))
-    dp.message.register(cmd_status, Command("status"))
-    dp.message.register(cmd_status, Command("me"))
-    dp.message.register(cmd_sites, Command("sites"))
-    dp.message.register(cmd_sites, Command("domains"))
-    dp.message.register(cmd_redeem, Command("redeem"))
-    dp.message.register(cmd_resolve, Command("resolve"))
-    dp.message.register(cmd_resolve, Command("r"))
-    dp.message.register(cmd_resolve, Command("bypass"))
-    dp.message.register(cmd_resolve, Command("unshort"))
-    dp.message.register(cmd_batch, Command("batch"))
-    dp.message.register(cmd_done, Command("done"))
-    dp.message.register(cmd_cancel, Command("cancel"))
+    # public commands
+    add(CommandHandler("start", tg(cmd_start)))
+    add(CommandHandler("help", tg(cmd_help)))
+    add(CommandHandler("plans", tg(cmd_plans)))
+    add(CommandHandler("status", tg(cmd_status)))
+    add(CommandHandler("me", tg(cmd_status)))
+    add(CommandHandler("sites", tg(cmd_sites)))
+    add(CommandHandler("domains", tg(cmd_sites)))
+    add(CommandHandler("redeem", tg(cmd_redeem)))
+    add(CommandHandler("resolve", tg(cmd_resolve)))
+    add(CommandHandler("r", tg(cmd_resolve)))
+    add(CommandHandler("bypass", tg(cmd_resolve)))
+    add(CommandHandler("unshort", tg(cmd_resolve)))
+    add(CommandHandler("batch", tg(cmd_batch)))
+    add(CommandHandler("done", tg(cmd_done)))
+    add(CommandHandler("cancel", tg(cmd_cancel)))
 
     # admin
-    dp.message.register(cmd_addvip, Command("addvip"))
-    dp.message.register(cmd_delvip, Command("delvip"))
-    dp.message.register(cmd_listvip, Command("listvip"))
-    dp.message.register(cmd_gencode, Command("gencode"))
-    dp.message.register(cmd_codes, Command("codes"))
-    dp.message.register(cmd_revoke, Command("revoke"))
-    dp.message.register(cmd_ban, Command("ban"))
-    dp.message.register(cmd_unban, Command("unban"))
-    dp.message.register(cmd_setadmin, Command("setadmin"))
-    dp.message.register(cmd_unsetadmin, Command("unsetadmin"))
-    dp.message.register(cmd_stats, Command("stats"))
-    dp.message.register(cmd_logs, Command("logs"))
-    dp.message.register(cmd_delays, Command("delays"))
-    dp.message.register(cmd_setdelay, Command("setdelay"))
-    dp.message.register(cmd_whois, Command("whois"))
-    dp.message.register(cmd_broadcast, Command("broadcast"))
-    dp.message.register(cmd_adminhelp, Command("admin"))
-    dp.message.register(cmd_adminhelp, Command("adminhelp"))
+    add(CommandHandler("addvip", tg(cmd_addvip)))
+    add(CommandHandler("delvip", tg(cmd_delvip)))
+    add(CommandHandler("listvip", tg(cmd_listvip)))
+    add(CommandHandler("gencode", tg(cmd_gencode)))
+    add(CommandHandler("codes", tg(cmd_codes)))
+    add(CommandHandler("revoke", tg(cmd_revoke)))
+    add(CommandHandler("ban", tg(cmd_ban)))
+    add(CommandHandler("unban", tg(cmd_unban)))
+    add(CommandHandler("setadmin", tg(cmd_setadmin)))
+    add(CommandHandler("unsetadmin", tg(cmd_unsetadmin)))
+    add(CommandHandler("stats", tg(cmd_stats)))
+    add(CommandHandler("logs", tg(cmd_logs)))
+    add(CommandHandler("delays", tg(cmd_delays)))
+    add(CommandHandler("setdelay", tg(cmd_setdelay)))
+    add(CommandHandler("whois", tg(cmd_whois)))
+    add(CommandHandler("broadcast", tg(cmd_broadcast)))
+    add(CommandHandler("admin", tg(cmd_adminhelp)))
+    add(CommandHandler("adminhelp", tg(cmd_adminhelp)))
 
-    # FSM catch-alls (must precede the generic text handler)
-    dp.message.register(on_broadcast_text, BotStates.broadcasting, F.text)
-    dp.message.register(on_text, BotStates.batch, F.text)
+    # state-gated catch-alls (must precede the generic text handler)
+    add(MessageHandler(_StateFilter(BotStates.broadcasting) & filters.TEXT,
+                       tg(on_broadcast_text)))
+    add(MessageHandler(_StateFilter(BotStates.batch) & filters.TEXT, tg(on_text)))
 
     # inline callbacks
-    dp.callback_query.register(cb_copy, F.data.startswith("copy:"))
-    dp.callback_query.register(cb_chain, F.data.startswith("chain:"))
-    dp.callback_query.register(cb_again, F.data.startswith("again:"))
-    dp.callback_query.register(cb_menu, F.data.startswith("menu:"))
-    dp.callback_query.register(cb_upsell, F.data == "upsell")
-    dp.callback_query.register(cb_noop, F.data.startswith("noop:"))
+    add(CallbackQueryHandler(tg(cb_copy), pattern=r"^copy:"))
+    add(CallbackQueryHandler(tg(cb_chain), pattern=r"^chain:"))
+    add(CallbackQueryHandler(tg(cb_again), pattern=r"^again:"))
+    add(CallbackQueryHandler(tg(cb_menu), pattern=r"^menu:"))
+    add(CallbackQueryHandler(tg(cb_upsell), pattern=r"^upsell$"))
+    add(CallbackQueryHandler(tg(cb_noop), pattern=r"^noop:"))
 
-    # generic text last
-    dp.message.register(on_text, F.text)
+    # generic text last. Deliberately NOT `& ~filters.COMMAND`: an unrecognised
+    # command (/foo) should still reach on_text and get the "no link spotted"
+    # reply, which is what it did under aiogram. Registered commands above win
+    # because PTB runs only the first matching handler in a group.
+    add(MessageHandler(filters.TEXT, tg(on_text)))
 
-    dp.message.register(on_non_text, F.content_type != ContentType.TEXT)
-    dp.errors.register(on_error)
+    add(MessageHandler(~filters.TEXT, tg(on_non_text)))
 
-    return dp
+    app.add_error_handler(on_error)
+    return sum(len(v) for v in app.handlers.values())
 
 
-async def on_startup(bot: Bot) -> None:
+async def on_startup(app: Application) -> None:
+    bot = app.bot
     me = await bot.get_me()
     log.info("logged in as @%s (id=%s)", me.username, me.id)
     log.info("registry: %d domains · backend: %s · impersonate: %s",
-             len(REGISTRY), "curl_cffi" if HTTP._cffi_ok else "aiohttp", CFG.impersonate)
+             len(REGISTRY), "curl_cffi" if HTTP._cffi_ok else "httpx",
+             CFG.impersonate)
     if CFG.admin_ids:
         for aid in CFG.admin_ids:
             DB.set_admin(aid, True)
@@ -3167,7 +3305,7 @@ async def on_startup(bot: Bot) -> None:
                 CFG.admin_ids[0],
                 f"🕶 <b>{esc(CFG.bot_name)} v{__version__} online</b>\n\n"
                 f"🧩 {len(REGISTRY)} shorteners registered\n"
-                f"⚙️ {'curl_cffi' if HTTP._cffi_ok else 'aiohttp'} / "
+                f"⚙️ {'curl_cffi' if HTTP._cffi_ok else 'httpx'} / "
                 f"{esc(CFG.impersonate)}\n"
                 f"👥 {DB.stats()['users']} known users\n\n/admin for the panel",
                 disable_notification=True)
@@ -3175,12 +3313,54 @@ async def on_startup(bot: Bot) -> None:
         log.warning("ADMIN_IDS is empty - nobody can manage VIP. Set it in .env")
 
 
-async def on_shutdown(bot: Bot) -> None:
+async def on_shutdown(app: Application) -> None:
     await HTTP.close()
     with contextlib.suppress(Exception):
         DB.trim_logs(14)
     DB.close()
     log.info("shut down cleanly")
+
+
+def default_bot_properties() -> Defaults:
+    """The Defaults every outgoing API call inherits.
+
+    `do_quote=False` matters: aiogram's `message.answer()` never quoted the
+    incoming message, but PTB's `reply_text()` DOES quote in group chats
+    unless told otherwise. This keeps behaviour identical to the port.
+    """
+    return Defaults(
+        parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        do_quote=False,
+    )
+
+
+def build_application(token: Optional[str] = None,
+                      bot: Optional[Bot] = None) -> Application:
+    """Assemble the Application. Safe to call offline - it makes no network
+    call until run_polling(), which is what lets --check and the test suite
+    build a real handler graph without a live bot.
+
+    `bot` exists purely as a test seam (PTB forbids setting `defaults` on the
+    builder once a Bot instance is supplied, so a custom bot must already
+    carry them). Production passes neither argument.
+    """
+    builder = Application.builder()
+    if bot is not None:
+        builder = builder.bot(bot)
+    else:
+        builder = builder.token(token or CFG.token or "0:placeholder") \
+                         .defaults(default_bot_properties())
+    app = (builder
+           # Load-bearing: PTB defaults to ONE update at a time
+           # (max_concurrent_updates=1), so a single 15s GPLinks resolve would
+           # block every other user for its whole duration. aiogram did not.
+           .concurrent_updates(True)
+           .post_init(on_startup)
+           .post_shutdown(on_shutdown)
+           .build())
+    register_handlers(app)
+    return app
 
 
 def preflight() -> bool:
@@ -3203,15 +3383,14 @@ def preflight() -> bool:
         # The bot still runs, but the reason it exists stops working. Say so
         # loudly instead of letting people debug mysterious 403s.
         warnings.append(
-            "curl_cffi is NOT available - running on the aiohttp fallback with no "
+            "curl_cffi is NOT available - running on the httpx fallback with no "
             "browser TLS impersonation.\n"
             "           Plain redirectors (bit.ly, tinyurl, ...) will still work, but "
             "Cloudflare-protected shorteners - GPLINKS INCLUDED - will likely return "
             "403.\n"
-            "           On Termux/Android this is expected: manylinux wheels do not "
-            "load against bionic libc.\n"
-            "           Fix: run inside a proot-distro Ubuntu (see TERMUX-SETUP.txt), "
-            "or pip install curl_cffi --pre.")
+            "           Fix: reinstall it - on Termux that needs Python 3.13/3.14 for "
+            "the prebuilt Android wheel.\n"
+            "           See install-termux.sh, which handles this automatically.")
 
     if sys.platform == "android" or os.path.exists("/data/data/com.termux"):
         warnings.append(
@@ -3234,16 +3413,17 @@ def main() -> int:
         format="%(asctime)s %(levelname)-7s %(name)s :: %(message)s",
         datefmt="%H:%M:%S",
     )
-    logging.getLogger("aiogram.event").setLevel(logging.WARNING)
-    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+    for noisy in ("telegram.ext", "telegram._bot", "httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     if "--check" in sys.argv:
         print(f"{__app__} v{__version__}")
+        print(f"  framework        : python-telegram-bot {telegram_ver}")
         print(f"  registry domains : {len(REGISTRY)}")
         print(f"  handlers         : "
               f"{sorted({p.handler for p in REGISTRY.values()})}")
         print(f"  backend          : "
-              f"{'curl_cffi' if HTTP._cffi_ok else 'aiohttp'} ({CFG.impersonate})")
+              f"{'curl_cffi' if HTTP._cffi_ok else 'httpx'} ({CFG.impersonate})")
         print(f"  db               : {os.path.abspath(CFG.db_path)}")
         print(f"  free limit       : {CFG.free_daily_limit}/day, "
               f"{CFG.free_cooldown}s cooldown")
@@ -3257,19 +3437,15 @@ def main() -> int:
               "(or pass --check to inspect the build).", file=sys.stderr)
         return 2
 
-    bot = Bot(token=CFG.token, default=DefaultBotProperties(
-        parse_mode=ParseMode.HTML,
-        link_preview=LinkPreviewOptions(is_disabled=True),
-    ))
-    dp = build_dispatcher()
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
+    app = build_application()
 
     print(f"\n🕶  {__app__} v{__version__} starting — "
           f"{len(REGISTRY)} shorteners, Ctrl+C to stop\n")
     try:
-        asyncio.run(dp.start_polling(
-            bot, allowed_updates=dp.resolve_used_update_types()))
+        # run_polling owns the event loop and calls on_startup / on_shutdown
+        # itself via post_init / post_shutdown.
+        app.run_polling(allowed_updates=Update.ALL_TYPES,
+                        drop_pending_updates=False)
     except (KeyboardInterrupt, SystemExit):
         print("\n👋 stopped")
     return 0

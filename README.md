@@ -111,8 +111,9 @@ Inspect and override the learned values with `/delays` and `/setdelay`.
 Most of these sites sit behind Cloudflare and reject plain HTTP clients by TLS
 fingerprint. `curl_cffi` impersonates a real Chrome handshake (JA3/JA4, HTTP/2
 frame order, header casing), which is what actually gets through. If it cannot
-be installed on your platform the bot silently falls back to `aiohttp` and logs
-it — everything still runs, some sites just 403.
+be installed on your platform the bot falls back to `httpx` and logs it —
+everything still runs, some sites just 403. Startup warns about this loudly
+rather than leaving you to debug mysterious 403s.
 
 ---
 
@@ -166,6 +167,8 @@ Get your own numeric user id from [@userinfobot](https://t.me/userinfobot).
 
 ### 2. Install
 
+**Linux / macOS / VPS**
+
 ```bash
 git clone https://github.com/demoneditz985-ctrl/SHADOWLINKS.git
 cd SHADOWLINKS
@@ -175,6 +178,16 @@ pip install -r requirements.txt
 ```
 
 Python **3.10+** required.
+
+**Termux on Android** — one command, no Ubuntu/proot container needed:
+
+```bash
+bash install-termux.sh
+```
+
+It installs the system packages, builds the venv, installs everything, checks
+that `.env` has a token, and runs the bot's self-check. See
+[Termux notes](#termux-on-android) below for why this is now trivial.
 
 ### 3. Configure
 
@@ -191,6 +204,7 @@ python shadowlinks_bot.py --check
 
 ```
 SHADOWLINKS v1.0.0
+  framework        : python-telegram-bot 22.8
   registry domains : 144
   handlers         : ['adfly','auto','form','gplinks','linkvertise','ouo','redirect']
   backend          : curl_cffi (chrome)
@@ -342,6 +356,58 @@ proxy**. It runs anywhere with outbound HTTPS.
 
 ---
 
+## Termux on Android
+
+Runs natively — no `proot-distro`, no Ubuntu container.
+
+```bash
+bash install-termux.sh
+```
+
+The framework choice is what makes this easy. `python-telegram-bot` depends
+only on `httpx`, so its tree is **11 of 13 packages pure Python** with no
+pydantic and no aiohttp anywhere in it. On Android arm64 that means:
+
+| Package | Install |
+|---|---|
+| python-telegram-bot, httpx, httpcore, h11, anyio, idna, certifi, typing_extensions, beautifulsoup4, soupsieve, pycparser | pure Python — always works |
+| `curl_cffi` | prebuilt `android_24` wheel for cp313 **and** cp314 |
+| `cffi` | compiles from C with clang in seconds |
+
+No Rust, no maturin, no third-party wheel index.
+
+**The one gotcha:** `curl_cffi`'s Android wheel is built for Python 3.13/3.14
+only. Termux ships 3.14 today, but an un-updated install may still be on 3.12 —
+and then curl_cffi cannot install, so Cloudflare-protected shorteners
+(GPLinks included) return 403. Everything else still works. Fix:
+
+```bash
+pkg update -y && pkg upgrade -y && pkg install -y python
+python --version          # want 3.13.x or 3.14.x
+```
+
+The installer detects this and says so instead of failing obscurely.
+
+**Keeping it alive** — Android kills background processes aggressively, so do
+all of these or the bot silently dies minutes after the screen turns off:
+
+1. `termux-wake-lock` before starting
+2. run it inside `tmux` (`pkg install tmux`) so closing Termux does not kill it
+3. Settings → Apps → Termux → Battery → **Unrestricted**
+4. on Xiaomi/Samsung/Oppo/Vivo, also enable **Autostart**
+
+Only the F-Droid or GitHub build of Termux works; the Play Store build is years
+out of date and cannot be updated.
+
+> **Why not aiogram?** aiogram 3 requires pydantic, whose compiled core has
+> almost no Android wheels, and aiogram 3.31 caps `pydantic<2.14` — which
+> excludes the one pydantic release that *does* have an Android wheel. On
+> Termux that meant a Rust build of `pydantic-core` that typically failed or
+> exhausted phone RAM. Switching frameworks removed the problem at the root
+> rather than working around it.
+
+---
+
 ## Adding shorteners without redeploying
 
 Shorteners change domain constantly. You do not need to edit code or rebuild —
@@ -383,23 +449,46 @@ chain got — that is usually enough to know which `EXTRA_*` list it belongs in.
 
 ## Testing
 
-The bot ships with no test files (single-file constraint), but the suite it was
-developed against covers it end to end — **76 checks, all passing**:
+The bot itself stays a single file, but the suite it was developed against
+lives in `tests/` and covers it end to end — **266 checks, all passing**:
 
-- **Resolver** — a local HTTP server reproduces the real GPLinks flow
-  (302 → paywall → `skip_sub` → form → timer rejection → JSON), plus plain
-  redirects, multi-hop chains, meta-refresh, JS redirects, `ysmm` decoding,
-  `powergam` interstitial decoding, SSRF refusal and 5-way concurrency.
-- **Bot** — real `Update` objects fed through the dispatcher with a stubbed
-  Telegram API: every command, quota enforcement, cooldowns, admin gating,
-  code minting/redemption/reuse-rejection, deep-link redemption, VIP batch FSM,
-  inline callbacks, ban enforcement and the SSRF path from inside a chat.
+```bash
+python tests/test_config.py      # 60  .env parsing, _env_bool/_env_list, preflight
+python tests/test_resolver.py    # 92  HTTP layer + resolver, on BOTH backends
+python tests/test_ptb.py         # 114 dispatcher, commands, callbacks, FSM, VIP
+```
 
-Two bugs this caught in development are worth knowing about, because they are
-the kind that ship silently:
+- **Config** — the `.env` parser against the *actual shipped file*, including
+  the inline-comment case that once silently disabled curl_cffi (see below).
+- **HTTP layer** — a real local server on `127.0.0.1`, and every assertion is
+  run **twice**: once on `curl_cffi` and once on the `httpx` fallback. The two
+  must agree on redirect handling, form-encoding, cookies, referer/origin
+  derivation, query params, error capture and body truncation. Plus
+  `page_urls()` meta-refresh/JS extraction, the paywall gate, the GPLinks
+  `go-link` form, and SSRF refusal at both the transport and resolver levels.
+- **Dispatcher** — fabricated `Update` objects pushed through the *real* PTB
+  `Application.process_update()`, so filters, handler ordering and the state
+  filters are genuinely exercised: every command, quota enforcement, cooldowns,
+  admin gating, code minting/redemption/reuse-rejection, deep-link redemption,
+  the VIP batch FSM, `/broadcast`, inline callbacks, ban enforcement, and
+  per-user state isolation.
 
-- aiogram calls handlers by **keyword name** and runs non-coroutine callbacks in
-  a thread pool — so `dp.message.register(lambda m, u, c: ...)` never awaits.
+Bugs this caught that are worth knowing about, because they are the kind that
+ship silently:
+
+- The `.env` loader stripped only surrounding quotes, so
+  `USE_CURL_CFFI=1  # note` parsed as the whole string. That is not `"1"`, so
+  `_env_bool()` returned False and the browser-TLS backend switched itself off
+  — **76 tests passed with that bug in place**, because they set the variable
+  directly instead of parsing the shipped file. Caught only by running
+  `--check` against a real `.env`.
+- python-telegram-bot defaults to **serial** update processing
+  (`max_concurrent_updates=1`). A single 15-second GPLinks resolve would have
+  frozen every other user for its whole duration. `concurrent_updates(True)` is
+  load-bearing, not a tuning nicety — and there is now a test asserting it.
+- PTB's `reply_text()` quotes the incoming message in group chats; aiogram's
+  `message.answer()` never did. `Defaults(do_quote=False)` keeps the behaviour
+  identical, and a test asserts no `reply_parameters` are sent.
 - a `dict` comprehension calling `kw.pop("label")` only pops on the first
   iteration, which quietly mislabelled 130 domains.
 
@@ -432,8 +521,10 @@ and running the bot is your call and your responsibility.
 
 ```
 SHADOWLINKS/
-├── shadowlinks_bot.py    ← the entire bot (~3,200 lines)
+├── shadowlinks_bot.py    ← the entire bot (~3,300 lines)
 ├── requirements.txt      ← 4 dependencies
+├── install-termux.sh     ← one-shot Android installer
+├── tests/                ← 266 checks across 3 files (not part of the bot)
 ├── .env.example          ← every setting, annotated
 ├── .gitignore            ← keeps .env and *.db out of git
 └── README.md
@@ -443,4 +534,4 @@ SHADOWLINKS/
 
 ---
 
-**v1.0.0** · Python 3.10+ · aiogram 3 · curl_cffi · BeautifulSoup 4 · SQLite
+**v1.1.0** · Python 3.10+ · python-telegram-bot 22 · curl_cffi · BeautifulSoup 4 · SQLite
