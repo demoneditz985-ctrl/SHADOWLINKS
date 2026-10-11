@@ -3184,16 +3184,47 @@ async def on_shutdown(bot: Bot) -> None:
 
 
 def preflight() -> bool:
-    """Fail fast with an actionable message instead of a traceback."""
-    problems = []
+    """Fail fast with an actionable message instead of a traceback.
+
+    Returns False only for things that make the bot unusable. Degraded-but-
+    runnable conditions are reported as warnings and startup continues.
+    """
+    problems: list[str] = []
+    warnings: list[str] = []
+
     if not CFG.token or ":" not in CFG.token:
         problems.append("BOT_TOKEN is missing. Create a bot with @BotFather, then put "
                         "the token in .env as BOT_TOKEN=123456:ABC-DEF…")
     if not CFG.admin_ids:
         problems.append("ADMIN_IDS is empty. Set ADMIN_IDS=<your telegram user id> so "
                         "you can grant VIP. Get your id from @userinfobot.")
+
+    if not HTTP._cffi_ok:
+        # The bot still runs, but the reason it exists stops working. Say so
+        # loudly instead of letting people debug mysterious 403s.
+        warnings.append(
+            "curl_cffi is NOT available - running on the aiohttp fallback with no "
+            "browser TLS impersonation.\n"
+            "           Plain redirectors (bit.ly, tinyurl, ...) will still work, but "
+            "Cloudflare-protected shorteners - GPLINKS INCLUDED - will likely return "
+            "403.\n"
+            "           On Termux/Android this is expected: manylinux wheels do not "
+            "load against bionic libc.\n"
+            "           Fix: run inside a proot-distro Ubuntu (see TERMUX-SETUP.txt), "
+            "or pip install curl_cffi --pre.")
+
+    if sys.platform == "android" or os.path.exists("/data/data/com.termux"):
+        warnings.append(
+            "Native Termux detected. Android also kills background processes "
+            "aggressively -\n"
+            "           run `termux-wake-lock` and disable battery optimisation for "
+            "Termux, or the bot\n"
+            "           will silently stop when the screen turns off.")
+
+    for w in warnings:
+        print(f"[SHADOWLINKS] ⚠️  {w}", file=sys.stderr)
     for p in problems:
-        print(f"[SHADOWLINKS] ⚠️  {p}", file=sys.stderr)
+        print(f"[SHADOWLINKS] ❌ {p}", file=sys.stderr)
     return not problems
 
 
