@@ -1,0 +1,147 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  SHADOWLINKS Solver API — Render Blueprint
+#
+#  Deploy: commit this file, then on Render
+#          New -> Blueprint -> pick this repo -> Apply.
+#  Render reads this file, creates the service and sets the env vars below.
+#
+#  Everything is also settable from the dashboard afterwards; the dashboard
+#  wins over this file once you edit it there.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  - type: web
+    name: shadowlinks-solver
+    runtime: python
+    plan: free                 # see the notes at the bottom before going live
+    region: oregon             # closest Render region to the shorteners' CDNs
+    numInstances: 1            # rate limits and the cache are per-instance
+
+    buildCommand: pip install -r requirements-api.txt
+    startCommand: python solver_api.py
+
+    # Render pings this itself, and it is what UptimeRobot should hit to keep
+    # a free service from spinning down. It must stay dependency-free: no
+    # auth, no network, no database. Do NOT point a keep-alive ping at
+    # /robots.txt - Render answers that itself while the service is asleep,
+    # so it never wakes anything up.
+    healthCheckPath: /health
+
+    autoDeploy: true
+    healthCheckTimeout: 120    # first boot imports 144 domains + probes TLS
+
+    envVars:
+      # abi3 wheel territory: any CPython >= 3.10 works. 3.12 is the safest
+      # widely-available choice on Render today.
+      - key: PYTHON_VERSION
+        value: 3.12.0
+
+      # ── THE ONLY VARIABLE YOU MUST SET ──────────────────────────────────
+      # Signs and verifies every API key. sync:false means Render will NOT
+      # store it in this file - you enter it once in the dashboard.
+      #
+      #   Generate one locally:   python solver_api.py --print-secret
+      #
+      # You need to know this value yourself, because minting a customer key
+      # (--mint) requires the SAME secret the server holds. If you let Render
+      # generate it privately you would have to copy it out of the dashboard
+      # before you could issue a single key.
+      #
+      # Changing it invalidates every key you have ever issued.
+      - key: AUTH_SECRET
+        sync: false
+
+      # Guards POST /admin/keys and the other /admin routes. Generated for
+      # you; read it in the dashboard when you need it. Leave it unset and
+      # the whole /admin surface returns 503 (disabled, not open).
+      - key: ADMIN_SECRET
+        generateValue: true
+
+      # ── resolver behaviour ──────────────────────────────────────────────
+      - key: HOST
+        value: 0.0.0.0          # Render only routes to a 0.0.0.0 listener
+      # PORT is injected by Render automatically; do not hardcode it.
+
+      - key: SOLVE_TIMEOUT
+        value: "90"             # seconds before /solve gives up on one link
+      - key: MAX_CONCURRENCY
+        value: "8"              # parallel outbound resolves. Raise with care:
+                                # more concurrency from ONE datacentre IP is
+                                # how you get that IP rate-limited or banned.
+      - key: HTTP_TIMEOUT
+        value: "20"
+      - key: MAX_HOPS
+        value: "12"
+      - key: GOLINK_DELAY
+        value: "5"              # default anti-bot wait; the resolver learns
+                                # the real value per domain at runtime
+      - key: BATCH_LIMIT
+        value: "25"
+
+      # ── rate limits for the free tier (VIP keys get 4x rpm, no daily cap) ──
+      - key: RATE_RPM
+        value: "30"
+      - key: FREE_DAILY_LIMIT
+        value: "100"
+
+      # ── cache ───────────────────────────────────────────────────────────
+      - key: CACHE_TTL
+        value: "3600"
+      - key: CACHE_MAX
+        value: "2000"
+
+      - key: LOG_LEVEL
+        value: INFO
+      - key: CORS_ORIGINS
+        value: "*"              # tighten to your own domain before selling
+
+      # ── leave these ALONE unless you know why ───────────────────────────
+      - key: USE_CURL_CFFI
+        value: "true"           # false drops you to httpx and Cloudflare
+                                # sites, GPLinks included, will 403
+      - key: ALLOW_PRIVATE_NETWORKS
+        value: "false"          # true turns OFF the SSRF guard and makes this
+                                # an open relay to your internal network.
+                                # The service refuses to start if it is true.
+      - key: AUTH_REVOKED_IDS
+        sync: false             # comma-separated key ids to kill, e.g. k_9f2c
+
+      # ── the Cloudflare escape hatch ─────────────────────────────────────
+      # Render runs on a DATACENTRE IP. Cloudflare scores those far more
+      # harshly than a residential or mobile connection, so a shortener that
+      # resolves fine from a phone can answer 403 from here. If that happens,
+      # set this to a residential/mobile proxy and both HTTP backends will
+      # egress through it:
+      #
+      #     PROXY_URL=http://user:pass@host:port
+      #
+      # This is a paid service (Bright Data, Oxylabs, IPRoyal, Smartproxy).
+      # It is the only real fix for IP-reputation blocking - no amount of TLS
+      # impersonation changes how Cloudflare scores your IP range.
+      - key: PROXY_URL
+        sync: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BEFORE YOU SELL ACCESS
+#
+#  1. plan: free spins the service down after 15 idle minutes and takes ~1
+#     minute to wake, during which callers get a Render loading page instead
+#     of JSON. Your UptimeRobot ping prevents that, but note it consumes
+#     ~720 of the 750 free instance-hours per month, and Render can still
+#     restart a free service at any time. $7/mo removes the spin-down and
+#     the hour cap.
+#
+#  2. The free tier has an EPHEMERAL FILESYSTEM: every restart wipes local
+#     files. That is why this service keeps no database - keys are signed
+#     tokens and the learned delays/cache/rate counters live in RAM. Nothing
+#     customer-facing is lost by a restart. If you add Postgres later,
+#     RateLimiter and DelayStore are the two things to repoint.
+#
+#  3. numInstances must stay 1 while rate limits are in memory. Scaling to 2
+#     instances means each has its own counters, so a key gets roughly double
+#     its quota. Move the limiter to Render Key Value (Redis) first.
+#
+#  4. CORS_ORIGINS="*" lets any website call your API from a browser using a
+#     key embedded in its frontend. Fine for server-to-server use, wrong if a
+#     customer puts the key in client-side JavaScript.
+# ─────────────────────────────────────────────────────────────────────────────

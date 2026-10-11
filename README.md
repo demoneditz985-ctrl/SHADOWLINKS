@@ -1,9 +1,14 @@
 # 🕶 SHADOWLINKS
 
-**A VIP link-resolver Telegram bot, in one Python file.**
+**A link-shortener resolver.** Paste a shortened, ad-gated link, get the **real
+destination URL** back — no ads, no timer, no captcha, no browser.
 
-Paste a shortened, ad-gated link into the chat and get the **real destination URL**
-back — no ads, no timer, no captcha, no browser.
+Two front ends share one resolver core. **The API is the active project.**
+
+| Front end | File | What it is |
+|---|---|---|
+| 🌐 **Solver API** | `solver_api.py` | FastAPI service built for **Render**. POST a link, get JSON. HMAC-signed API keys, per-key rate limits and quotas, batch endpoint, live stats, an SSRF guard — and **no database**, because Render's disk is ephemeral. Full reference: **[API.md](API.md)** |
+| 🤖 **Telegram bot** | `shadowlinks_bot.py` | The original. python-telegram-bot 22, VIP tiers, redeem codes, admin panel, SQLite. Runs natively on Termux, one file, no `.env` |
 
 ```
 You  ▸ https://gplinks.co/BFfOX
@@ -18,17 +23,31 @@ Bot  ▸ 🎯 Destination unlocked
        ⏱ Resolved   : 11.42s
 ```
 
+```
+POST /solve   {"url": "https://gplinks.co/BFfOX"}
+
+              {"ok": true,
+               "destination": "https://real-destination.example.com/files/report.pdf",
+               "shortener": "gplinks.co", "handler": "gplinks",
+               "hops": 3, "elapsed_ms": 11420, "cached": false, "error": ""}
+```
+
 Built primarily for **GPLinks**, with a universal engine that also handles
 **144 shortener domains** out of the box — and any domain *not* in the table.
+
+A resolver fix goes into the shared engine and the API inherits it byte for
+byte — see [how the two share code](API.md#11-relationship-to-the-telegram-bot).
 
 ---
 
 ## Contents
 
+- **[Solver API → API.md](API.md)** — deploy to Render, keys, endpoints, errors
+- [Solver API quick start](#solver-api-quick-start)
 - [What it does](#what-it-does)
 - [How the GPLinks unlock works](#how-the-gplinks-unlock-works)
 - [Supported shorteners](#supported-shorteners)
-- [Quick start](#quick-start)
+- [Telegram bot quick start](#telegram-bot-quick-start)
 - [Commands](#commands)
 - [Configuration](#configuration)
 - [Deployment](#deployment)
@@ -151,11 +170,71 @@ signals — a countdown, "please wait", a captcha, a `go-link` form. On a genuin
 destination page the bot never follows a random outbound link and reports
 success wrongly.
 
-Send `/sites` to the bot for the live list.
+Send `/sites` to the bot for the live list, or `GET /domains` on the API.
 
 ---
 
-## Quick start
+## Solver API quick start
+
+The API is one file, `solver_api.py`, with no Telegram dependency and no
+database. Full reference in **[API.md](API.md)**.
+
+### Deploy to Render
+
+`render.yaml` is a Blueprint, so Render builds the service and its environment
+from this repo:
+
+```
+Render → New → Blueprint → pick this repo → Apply
+```
+
+The only variable you must supply is `AUTH_SECRET`, which signs every API key:
+
+```bash
+python solver_api.py --print-secret
+```
+
+You need to know that value yourself — minting a customer key requires the
+*same* secret the server holds, because the signature is the only record of a
+key that exists.
+
+### Keep it awake
+
+```
+UptimeRobot → HTTP(s) → https://YOUR-APP.onrender.com/health → every 5 min
+```
+
+Ping **`/health`**, never `/robots.txt`: while a free service is asleep Render
+answers `/robots.txt` itself, so a monitor pointed there reports healthy
+forever and never wakes anything.
+
+### Issue a key and call it
+
+```bash
+AUTH_SECRET=<your secret> python solver_api.py --mint acme-corp --tier vip --days 90
+
+curl -X POST https://YOUR-APP.onrender.com/solve \
+     -H "X-API-Key: shk...." \
+     -H "Content-Type: application/json" \
+     -d '{"url":"https://gplinks.co/BFfOX"}'
+```
+
+Interactive docs are at `/docs`. Verify everything offline first with
+`python solver_api.py --selfcheck` (34 assertions, no network).
+
+### Read this before you sell access
+
+**Render runs on datacentre IPs, and Cloudflare scores those far more harshly
+than your phone's residential IP.** A shortener that resolves fine from a phone
+can return 403 from Render. No amount of TLS impersonation changes how
+Cloudflare scores your IP range — the fix is `PROXY_URL` pointed at a
+residential proxy, which is a paid service. See
+[Does it actually bypass?](API.md#8-does-it-actually-bypass) for what is and is
+not verified. Test your own links before charging anyone.
+
+---
+
+## Telegram bot quick start
 
 ### 1. Create the bot
 
@@ -477,14 +556,30 @@ chain got — that is usually enough to know which `EXTRA_*` list it belongs in.
 
 ## Testing
 
-The bot itself stays a single file, but the suite it was developed against
-lives in `tests/` and covers it end to end — **294 checks, all passing**:
+Both front ends stay single files, but the suite they were developed against
+lives in `tests/` and covers them end to end — **435 checks, all passing**:
 
 ```bash
-python tests/test_config.py      # 88  SETTINGS block, no-.env guarantee, preflight
-python tests/test_resolver.py    # 92  HTTP layer + resolver, on BOTH backends
+python tests/test_api.py         # 141 the API over REAL HTTP (ASGI stack)
+python tests/test_resolver.py    #  92 HTTP layer + resolver, on BOTH backends
 python tests/test_ptb.py         # 114 dispatcher, commands, callbacks, FSM, VIP
+python tests/test_config.py      #  88 SETTINGS block, no-.env guarantee, preflight
 ```
+
+- **API** — a real local HTTP server acts as the fixture shortener and the
+  suite drives the API through the full ASGI stack: middleware, dependencies,
+  validation, handlers. Forged / tampered / expired / revoked keys, Bearer and
+  query-string auth, per-key rate limits and daily quotas, batch ordering,
+  cache behaviour, the SSRF guard against the cloud metadata endpoint, the
+  admin surface, every deploy mode, and the anti-bot challenge contract.
+  Nothing reaches the internet.
+- **Anti-bot challenges** — the resolver identifies 15 systems (DataDome,
+  Cloudflare Turnstile, hCaptcha, reCAPTCHA, GeeTest, Arkose, PerimeterX,
+  Kasada, Imperva, DDoS-Guard …) and refuses to return any of their URLs as an
+  answer. This exists because a live test caught the resolver handing back a
+  DataDome captcha URL with `ok: true` — the worst failure a solver can have.
+  The suite pins both the detection and the false positives it must *not*
+  produce.
 
 - **Config** — the SETTINGS block, env-override precedence, the placeholder
   guard, `_split_hosts`, and an assertion that **no `.env` or config file
@@ -552,16 +647,29 @@ and running the bot is your call and your responsibility.
 
 ```
 SHADOWLINKS/
-├── shadowlinks_bot.py    ← the entire bot (~3,300 lines)
+│   ── solver API (the active project) ─────────────────────────────────
+├── solver_api.py         ← the entire API (~2,980 lines, one file)
+├── API.md                ← deploy, keys, endpoints, errors, honest limits
+├── requirements-api.txt  ← 5 dependencies, no Telegram
+├── render.yaml           ← Render Blueprint: service + environment
+├── Procfile              ← for Railway / Fly / Heroku
+│   ── telegram bot ────────────────────────────────────────────────────
+├── shadowlinks_bot.py    ← the entire bot (~3,600 lines)
 ├── requirements.txt      ← 4 dependencies
 ├── install-termux.sh     ← one-shot Android installer
-├── tests/                ← 294 checks across 3 files (not part of the bot)
-├── .gitignore            ← keeps *.db and any .env out of git
+│   ── shared ──────────────────────────────────────────────────────────
+├── tests/                ← 435 checks across 4 files
+├── .gitignore            ← keeps secrets, *.db and any .env out of git
 └── README.md
 ```
 
-`shadowlinks.db` is created on first run and git-ignored.
+`shadowlinks.db` is created by the bot on first run and git-ignored. The API
+creates no files at all — that is deliberate, so a Render restart cannot lose
+anything.
 
 ---
 
-**v1.1.0** · Python 3.10+ · python-telegram-bot 22 · curl_cffi · BeautifulSoup 4 · SQLite
+**API v2.0.0** · FastAPI · uvicorn · curl_cffi · BeautifulSoup 4 · no database
+**Bot v1.1.0** · python-telegram-bot 22 · curl_cffi · BeautifulSoup 4 · SQLite
+
+Both: Python 3.10+ · one file each · 144 shortener domains · 435 tests

@@ -1,7 +1,10 @@
-# secrets
+# secrets - never commit a token, an AUTH_SECRET or an API key
 .env
 *.env
+.env.*
 !.env.example
+secrets.txt
+*.pem
 
 # runtime database (SQLite + WAL sidecars)
 *.db

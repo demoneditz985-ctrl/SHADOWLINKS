@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  SHADOWLINKS Solver API — runtime dependencies
+#
+#  Install:   pip install -r requirements-api.txt
+#
+#  This is deliberately NOT the bot's requirements.txt. The API has no
+#  Telegram dependency at all, so python-telegram-bot is not installed.
+#
+#  Why every one of these installs cleanly on Render (unlike on Termux):
+#    curl_cffi 0.16.3 publishes a cp310-abi3 manylinux_2_17_x86_64 wheel.
+#    "abi3" means that single wheel works on CPython 3.10, 3.11, 3.12, 3.13
+#    and 3.14 - no source build, no Rust, no per-version pinning.
+#    Everything else here is pure Python.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# HTTP framework + ASGI server
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
+# HTML parsing: meta-refresh, hidden <form id="go-link"> inputs, CTA links
+beautifulsoup4>=4.12
+
+# Primary HTTP backend. Impersonates a real Chrome TLS/JA3 fingerprint, which
+# is what gets past the passive Cloudflare check most of these shorteners sit
+# behind. WITHOUT IT, GPLinks and friends answer 403 - see API.md.
+curl_cffi>=0.7
+
+# Fallback HTTP backend, used automatically if curl_cffi is unavailable.
+# Also the client FastAPI's TestClient runs on, so the test suite needs it.
+httpx>=0.27

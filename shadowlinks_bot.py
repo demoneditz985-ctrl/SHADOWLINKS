@@ -1227,6 +1227,7 @@ class ResolveOutcome:
     candidates: list[str] = field(default_factory=list)
     elapsed_ms: int = 0
     partial: bool = False
+    challenge: str = ""     # anti-bot system that stopped us, if any
 
     @property
     def depth(self) -> int:
@@ -1601,9 +1602,107 @@ def page_urls(page_url: str, text: str, tight_only: bool = False) -> list[tuple[
     return result
 
 
+# ── anti-bot challenge detection ──────────────────────────────────────────
+# Handing a challenge URL back as the resolved destination is the worst
+# failure a solver can have: it reports success and gives the caller a link
+# that renders a captcha instead of their file. Found by a live test against
+# a DataDome-protected host - the mocked fixtures could never surface it,
+# because no fixture was a captcha page.
+CHALLENGE_DOMAINS = (
+    ("captcha-delivery.com", "DataDome"),
+    ("challenges.cloudflare.com", "Cloudflare Turnstile"),
+    ("hcaptcha.com", "hCaptcha"),
+    ("recaptcha.net", "reCAPTCHA"),
+    ("geetest.com", "GeeTest"),
+    ("arkoselabs.com", "Arkose Labs"),
+    ("funcaptcha.com", "FunCaptcha"),
+    ("perimeterx.net", "PerimeterX"),
+    ("px-cdn.net", "PerimeterX"),
+    ("pxchk.net", "PerimeterX"),
+    ("kasada.io", "Kasada"),
+    ("shapesecurity.com", "Shape Security"),
+    ("incapsula.com", "Imperva Incapsula"),
+    ("secsso.com", "Imperva Incapsula"),
+    ("ddos-guard.net", "DDoS-Guard"),
+)
+
+# Deliberately specific strings, not the bare word "captcha": a legitimate
+# destination can easily contain that word in its path.
+CHALLENGE_URL_MARKERS = (
+    ("/cdn-cgi/challenge-platform", "Cloudflare"),
+    ("__cf_chl", "Cloudflare"),
+    ("cf-turnstile", "Cloudflare Turnstile"),
+    ("initialcid=", "DataDome"),
+    ("g-recaptcha", "reCAPTCHA"),
+    ("/recaptcha/api", "reCAPTCHA"),
+    "/hcaptcha",
+    ("geetest", "GeeTest"),
+    ("_incapsula_resource", "Imperva Incapsula"),
+    ("px-captcha", "PerimeterX"),
+)
+
+CHALLENGE_PAGE_MARKERS = (
+    ("captcha-delivery", "DataDome"),
+    ("datadome", "DataDome"),
+    ("cf-challenge-platform", "Cloudflare"),
+    ("cf_chl_opt", "Cloudflare"),
+    ("cf-turnstile", "Cloudflare Turnstile"),
+    ("checking your browser before accessing", "Cloudflare"),
+    ("just a moment", "Cloudflare"),
+    ("enable javascript and cookies to continue", "Cloudflare"),
+    ("attention required! | cloudflare", "Cloudflare"),
+    ("verify you are human", "anti-bot"),
+    ("verifying you are human", "anti-bot"),
+    ("grecaptcha.render", "reCAPTCHA"),
+    ("hcaptcha.com/captcha", "hCaptcha"),
+    ("geetest_", "GeeTest"),
+    ("funcaptcha", "FunCaptcha"),
+    ("_incapsula_resource", "Imperva Incapsula"),
+    ("you have been blocked", "WAF"),
+    ("px-captcha", "PerimeterX"),
+)
+
+
+def challenge_name(url: str = "", text: str = "") -> str:
+    """Name the anti-bot system guarding this URL/page, or "" if none.
+
+    Checked on the URL of every hop, so no handler - however loose its
+    extraction - can return a captcha as an answer.
+    """
+    if url:
+        h = host_of(url)
+        for dom, name in CHALLENGE_DOMAINS:
+            if h == dom or h.endswith("." + dom):
+                return name
+        low = url.lower()
+        for marker in CHALLENGE_URL_MARKERS:
+            # tolerate the shorthand entries that carry no label
+            m, name = marker if isinstance(marker, tuple) else (marker, "captcha")
+            if m in low:
+                return name
+    if text:
+        low = text[:20000].lower()
+        for marker, name in CHALLENGE_PAGE_MARKERS:
+            if marker in low:
+                return name
+    return ""
+
+
+def challenge_error(name: str) -> str:
+    """One shared explanation, so every path that hits a wall says the same
+    thing - and names the fix rather than only the symptom."""
+    return (f"Stopped by an anti-bot challenge ({name}). The site served a "
+            "captcha or browser check instead of a redirect. This is an "
+            "IP-reputation problem: the host does not trust this server's "
+            "address range. A residential or mobile proxy is the only "
+            "reliable fix.")
+
+
 def plausible_destination(url: str, page_url: str) -> bool:
-    """Filter out self-links, ads and the shortener's own assets."""
+    """Filter out self-links, ads, captchas and the shortener's own assets."""
     if not looks_like_destination(url):
+        return False
+    if challenge_name(url):
         return False
     h = host_of(url)
     bad = ("google.com/recaptcha", "facebook.com/tr", "doubleclick.net",
@@ -1694,6 +1793,15 @@ class LinkResolver:
                 break
             nxt = normalize_url(nxt)
             if not nxt:
+                break
+            blocked_by = challenge_name(url=nxt)
+            if blocked_by:
+                # Report the wall instead of climbing over it and pretending
+                # the other side is the answer.
+                out.challenge = blocked_by
+                out.error = challenge_error(blocked_by)
+                out.hops.append(Hop(url=current, kind=kind,
+                                    note=f"blocked by {blocked_by}"))
                 break
             if nxt in seen:
                 if normalize_url(nxt) != normalize_url(current):
@@ -2113,7 +2221,18 @@ class LinkResolver:
         text = r.text
         page_url = r.final_url or url
 
-        # 2a) GPLinks-style "Go Ad-Free" paywall -> take the skip_sub door
+        # 2a) Landed ON a challenge domain? Stop before extracting anything.
+        # URL-only here on purpose - see the text check at the end of this
+        # method for why page copy alone must not veto a working redirect.
+        wall = challenge_name(url=page_url)
+        if wall:
+            out.challenge = wall
+            out.error = challenge_error(wall)
+            out.hops.append(Hop(url=url, kind="challenge",
+                                note=f"blocked by {wall}"))
+            return None, "", ""
+
+        # 2b) GPLinks-style "Go Ad-Free" paywall -> take the skip_sub door
         if has_paywall(text) and "skip_sub" not in page_url:
             alt = await s.get(add_query(page_url, skip_sub="1"), allow_redirects=True,
                               referer=prof.referer or url)
@@ -2163,6 +2282,24 @@ class LinkResolver:
                 if best not in out.candidates:
                     out.candidates.append(best)
                 return best, "cta", "best outbound link on interstitial"
+
+        # Nothing unambiguous survived filtering. If the page reads like a bot
+        # check, say so instead of the generic "no destination found" - it
+        # tells the operator the fix is a proxy, not a code change.
+        #
+        # Checked HERE rather than before extraction, deliberately. Real
+        # shortener ad-gates use phrases like "verifying you are human" right
+        # next to a legitimate meta-refresh, so page copy must never veto a
+        # redirect that actually works. Conversely a challenge page's own
+        # captcha URL is filtered out by plausible_destination(), so it cannot
+        # reach this point disguised as an answer.
+        wall = challenge_name(text=text)
+        if wall:
+            out.challenge = wall
+            out.error = challenge_error(wall)
+            out.hops.append(Hop(url=url, kind="challenge",
+                                note=f"blocked by {wall}"))
+            return None, "", ""
         return None, "", "no destination found on page"
 
 
